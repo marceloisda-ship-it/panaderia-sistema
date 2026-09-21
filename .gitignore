@@ -1,0 +1,20 @@
+# Base de datos (contiene datos reales de clientes: nombres, teléfonos)
+*.db
+*.db-journal
+
+# Python
+__pycache__/
+*.pyc
+
+# Streamlit
+.streamlit/
+
+# Logs
+*.log
+
+# Configuración local de Claude Code (específica de esta máquina)
+.claude/
+
+# Entornos virtuales, por si se usan más adelante
+venv/
+.venv/
