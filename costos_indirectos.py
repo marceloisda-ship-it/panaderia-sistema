@@ -66,8 +66,8 @@ def actualizar_configuracion(costo_empaque_unidad: float, valor_hora_mano_obra: 
     try:
         conn.execute(
             """UPDATE configuracion_costos
-               SET costo_empaque_unidad = ?, valor_hora_mano_obra = ?,
-                   tarifa_electrica_kwh = ?, factor_descuento_luz = ?
+               SET costo_empaque_unidad = %s, valor_hora_mano_obra = %s,
+                   tarifa_electrica_kwh = %s, factor_descuento_luz = %s
                WHERE id = 1""",
             (costo_empaque_unidad, valor_hora_mano_obra, tarifa_electrica_kwh, factor_descuento_luz),
         )

@@ -49,7 +49,7 @@ def _pedidos_creados_entre(desde: str, hasta: str) -> list[dict]:
         ids = [
             f["id"] for f in conn.execute(
                 """SELECT id FROM pedidos
-                   WHERE date(fecha_creacion) >= ? AND date(fecha_creacion) <= ?
+                   WHERE fecha_creacion::date >= %s AND fecha_creacion::date <= %s
                    ORDER BY fecha_creacion ASC""",
                 (desde, hasta),
             ).fetchall()

@@ -22,10 +22,17 @@ MEDIOS_CON_COMISION = ("debito", "credito")
 
 def registrar_movimiento(tipo: str, monto: float, medio_pago: str,
                           categoria: str | None = None, descripcion: str | None = None,
-                          fecha: str | None = None) -> int:
+                          fecha: str | None = None, conn=None) -> int:
     """Registra un ingreso o gasto en la caja. Retorna el id del movimiento.
 
     `fecha` debe ir en formato YYYY-MM-DD; si no se indica, se usa hoy.
+
+    `conn` es opcional: si se pasa una conexión ya abierta (por ejemplo
+    desde pedidos.entregar_y_cobrar, para que la actualización del pedido
+    y el ingreso en caja queden en una sola transacción), se usa esa
+    misma conexión sin comitear ni cerrarla — es responsabilidad de quien
+    la pasó. Si no se pasa, se abre y cierra una conexión propia, como
+    siempre.
     """
     if tipo not in TIPOS_VALIDOS:
         raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
@@ -36,18 +43,24 @@ def registrar_movimiento(tipo: str, monto: float, medio_pago: str,
 
     fecha = fecha or date.today().isoformat()
 
-    conn = conectar()
+    conexion_propia = conn is None
+    if conexion_propia:
+        conn = conectar()
     try:
         cursor = conn.cursor()
         cursor.execute(
             """INSERT INTO movimientos_caja (tipo, monto, medio_pago, categoria, descripcion, fecha)
-               VALUES (?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s)
+               RETURNING id""",
             (tipo, monto, medio_pago, categoria, descripcion, fecha),
         )
-        conn.commit()
-        return cursor.lastrowid
+        movimiento_id = cursor.fetchone()["id"]
+        if conexion_propia:
+            conn.commit()
+        return movimiento_id
     finally:
-        conn.close()
+        if conexion_propia:
+            conn.close()
 
 
 def eliminar_movimiento(movimiento_id: int) -> None:
@@ -55,10 +68,10 @@ def eliminar_movimiento(movimiento_id: int) -> None:
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM movimientos_caja WHERE id = ?", (movimiento_id,))
+        cursor.execute("SELECT id FROM movimientos_caja WHERE id = %s", (movimiento_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un movimiento con id {movimiento_id}")
-        cursor.execute("DELETE FROM movimientos_caja WHERE id = ?", (movimiento_id,))
+        cursor.execute("DELETE FROM movimientos_caja WHERE id = %s", (movimiento_id,))
         conn.commit()
     finally:
         conn.close()
@@ -75,16 +88,16 @@ def listar_movimientos(desde: str | None = None, hasta: str | None = None,
     parametros = []
 
     if desde:
-        condiciones.append("fecha >= ?")
+        condiciones.append("fecha >= %s")
         parametros.append(desde)
     if hasta:
-        condiciones.append("fecha <= ?")
+        condiciones.append("fecha <= %s")
         parametros.append(hasta)
     if tipo:
-        condiciones.append("tipo = ?")
+        condiciones.append("tipo = %s")
         parametros.append(tipo)
     if medio_pago:
-        condiciones.append("medio_pago = ?")
+        condiciones.append("medio_pago = %s")
         parametros.append(medio_pago)
 
     query = "SELECT * FROM movimientos_caja"
@@ -180,7 +193,7 @@ def actualizar_configuracion_comisiones(tasa_debito_pct: float, tasa_credito_pct
     try:
         conn.execute(
             """UPDATE configuracion_comisiones
-               SET tasa_debito_pct = ?, tasa_credito_pct = ?, iva_pct = ?
+               SET tasa_debito_pct = %s, tasa_credito_pct = %s, iva_pct = %s
                WHERE id = 1""",
             (tasa_debito_pct, tasa_credito_pct, iva_pct),
         )

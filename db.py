@@ -15,17 +15,49 @@ import psycopg2
 import psycopg2.extras
 
 
-def conectar() -> psycopg2.extensions.connection:
+class _ConexionConExecute:
+    """Envuelve una conexión psycopg2 para agregarle un método `.execute()`
+    a nivel de conexión, igual que trae sqlite3 nativamente. psycopg2 solo
+    permite ejecutar consultas desde un cursor — sin este envoltorio,
+    habría que reescribir cada `conn.execute(...)` de los 8 módulos de
+    negocio por `cursor = conn.cursor(); cursor.execute(...)`. Todo lo
+    demás (placeholders %s, RETURNING en vez de lastrowid, etc.) sí hubo
+    que ajustarlo módulo por módulo — esto solo evita ese cambio en
+    particular, que era puramente mecánico."""
+
+    def __init__(self, conn):
+        self._conn = conn
+
+    def execute(self, query, params=None):
+        cursor = self._conn.cursor()
+        cursor.execute(query, params or ())
+        return cursor
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        self._conn.close()
+
+
+def conectar() -> _ConexionConExecute:
     """Abre y retorna una conexión a la base de datos Postgres (Supabase).
 
     Se usa `RealDictCursor` para poder seguir accediendo a las columnas
     de los resultados por nombre (ej. fila["nombre"]), igual que con
     sqlite3.Row en la versión anterior local.
     """
-    return psycopg2.connect(
+    conn = psycopg2.connect(
         st.secrets["postgres"]["url"],
         cursor_factory=psycopg2.extras.RealDictCursor,
     )
+    return _ConexionConExecute(conn)
 
 
 def inicializar_db() -> None:

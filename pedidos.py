@@ -30,18 +30,20 @@ def crear_pedido(cliente_id: int, fecha_entrega: str, notas: str | None = None) 
     fecha_creacion = datetime.now().isoformat(timespec="seconds")
     conn = conectar()
     try:
-        cliente = conn.execute("SELECT id FROM clientes WHERE id = ?", (cliente_id,)).fetchone()
+        cliente = conn.execute("SELECT id FROM clientes WHERE id = %s", (cliente_id,)).fetchone()
         if cliente is None:
             raise ValueError(f"No existe un cliente con id {cliente_id}")
 
         cursor = conn.cursor()
         cursor.execute(
             """INSERT INTO pedidos (cliente_id, fecha_entrega, estado, pagado, notas, fecha_creacion)
-               VALUES (?, ?, 'pendiente', 0, ?, ?)""",
+               VALUES (%s, %s, 'pendiente', FALSE, %s, %s)
+               RETURNING id""",
             (cliente_id, fecha_entrega, notas, fecha_creacion),
         )
+        pedido_id = cursor.fetchone()["id"]
         conn.commit()
-        return cursor.lastrowid
+        return pedido_id
     finally:
         conn.close()
 
@@ -56,15 +58,15 @@ def agregar_item_pedido(pedido_id: int, receta_id: int, cantidad: int) -> None:
     conn = conectar()
     try:
         receta = conn.execute(
-            "SELECT precio_venta FROM recetas WHERE id = ?", (receta_id,)
+            "SELECT precio_venta FROM recetas WHERE id = %s", (receta_id,)
         ).fetchone()
         if receta is None:
             raise ValueError(f"No existe una receta con id {receta_id}")
 
         conn.execute(
             """INSERT INTO pedido_items (pedido_id, receta_id, cantidad, precio_unitario)
-               VALUES (?, ?, ?, ?)
-               ON CONFLICT(pedido_id, receta_id)
+               VALUES (%s, %s, %s, %s)
+               ON CONFLICT (pedido_id, receta_id)
                DO UPDATE SET cantidad = excluded.cantidad""",
             (pedido_id, receta_id, cantidad, receta["precio_venta"]),
         )
@@ -77,7 +79,7 @@ def quitar_item_pedido(pedido_id: int, receta_id: int) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "DELETE FROM pedido_items WHERE pedido_id = ? AND receta_id = ?",
+            "DELETE FROM pedido_items WHERE pedido_id = %s AND receta_id = %s",
             (pedido_id, receta_id),
         )
         conn.commit()
@@ -90,7 +92,7 @@ def _obtener_pedido(conn, pedido_id: int) -> dict:
         """SELECT p.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
            FROM pedidos p
            JOIN clientes c ON c.id = p.cliente_id
-           WHERE p.id = ?""",
+           WHERE p.id = %s""",
         (pedido_id,),
     ).fetchone()
     if fila is None:
@@ -107,7 +109,7 @@ def detalle_pedido(pedido_id: int) -> dict:
             """SELECT r.nombre, pi.receta_id, pi.cantidad, pi.precio_unitario
                FROM pedido_items pi
                JOIN recetas r ON r.id = pi.receta_id
-               WHERE pi.pedido_id = ?
+               WHERE pi.pedido_id = %s
                ORDER BY r.nombre ASC""",
             (pedido_id,),
         ).fetchall()
@@ -217,13 +219,13 @@ def listar_pedidos(desde: str | None = None, hasta: str | None = None,
     condiciones = []
     parametros = []
     if desde:
-        condiciones.append("fecha_entrega >= ?")
+        condiciones.append("fecha_entrega >= %s")
         parametros.append(desde)
     if hasta:
-        condiciones.append("fecha_entrega <= ?")
+        condiciones.append("fecha_entrega <= %s")
         parametros.append(hasta)
     if estado:
-        condiciones.append("estado = ?")
+        condiciones.append("estado = %s")
         parametros.append(estado)
 
     query = "SELECT id FROM pedidos"
@@ -246,10 +248,10 @@ def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM pedidos WHERE id = ?", (pedido_id,))
+        cursor.execute("SELECT id FROM pedidos WHERE id = %s", (pedido_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un pedido con id {pedido_id}")
-        cursor.execute("UPDATE pedidos SET estado = ? WHERE id = ?", (nuevo_estado, pedido_id))
+        cursor.execute("UPDATE pedidos SET estado = %s WHERE id = %s", (nuevo_estado, pedido_id))
         conn.commit()
     finally:
         conn.close()
@@ -269,7 +271,7 @@ def eliminar_pedido(pedido_id: int) -> None:
     Caja, o usar cancelar_pedido si se prefiere conservar el registro."""
     conn = conectar()
     try:
-        fila = conn.execute("SELECT pagado FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
+        fila = conn.execute("SELECT pagado FROM pedidos WHERE id = %s", (pedido_id,)).fetchone()
         if fila is None:
             raise ValueError(f"No existe un pedido con id {pedido_id}")
         if fila["pagado"]:
@@ -279,7 +281,7 @@ def eliminar_pedido(pedido_id: int) -> None:
                 "si prefieres conservar el registro."
             )
 
-        conn.execute("DELETE FROM pedidos WHERE id = ?", (pedido_id,))
+        conn.execute("DELETE FROM pedidos WHERE id = %s", (pedido_id,))
         conn.commit()
     finally:
         conn.close()
@@ -291,14 +293,14 @@ def reagendar_pedido(pedido_id: int, nueva_fecha_entrega: str) -> None:
     o cancelado."""
     conn = conectar()
     try:
-        pedido = conn.execute("SELECT estado FROM pedidos WHERE id = ?", (pedido_id,)).fetchone()
+        pedido = conn.execute("SELECT estado FROM pedidos WHERE id = %s", (pedido_id,)).fetchone()
         if pedido is None:
             raise ValueError(f"No existe un pedido con id {pedido_id}")
         if pedido["estado"] in ("entregado", "cancelado"):
             raise ValueError(f"No se puede reagendar un pedido '{pedido['estado']}'")
 
         conn.execute(
-            "UPDATE pedidos SET fecha_entrega = ? WHERE id = ?",
+            "UPDATE pedidos SET fecha_entrega = %s WHERE id = %s",
             (nueva_fecha_entrega, pedido_id),
         )
         conn.commit()
@@ -316,14 +318,14 @@ def reagendar_pedidos_por_fecha(fecha_actual: str, nueva_fecha_entrega: str) -> 
     try:
         filas = conn.execute(
             """SELECT id FROM pedidos
-               WHERE fecha_entrega = ? AND estado NOT IN ('entregado', 'cancelado')""",
+               WHERE fecha_entrega = %s AND estado NOT IN ('entregado', 'cancelado')""",
             (fecha_actual,),
         ).fetchall()
         ids = [f["id"] for f in filas]
         if ids:
             conn.execute(
-                """UPDATE pedidos SET fecha_entrega = ?
-                   WHERE fecha_entrega = ? AND estado NOT IN ('entregado', 'cancelado')""",
+                """UPDATE pedidos SET fecha_entrega = %s
+                   WHERE fecha_entrega = %s AND estado NOT IN ('entregado', 'cancelado')""",
                 (nueva_fecha_entrega, fecha_actual),
             )
             conn.commit()
@@ -347,6 +349,11 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
 
     No se puede llamar dos veces sobre el mismo pedido (evita duplicar
     el ingreso en caja), ni sobre un pedido cancelado o sin ítems.
+
+    Todo (marcar el pedido como pagado + el/los movimiento(s) en caja)
+    queda en una sola transacción: si algo falla a mitad de camino, se
+    deshace todo — nunca queda un pedido marcado como pagado sin su
+    ingreso en caja, ni viceversa.
     """
     if medio_pago not in mod_caja.MEDIOS_VALIDOS:
         raise ValueError(f"medio_pago debe ser uno de {mod_caja.MEDIOS_VALIDOS}")
@@ -360,33 +367,39 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
         raise ValueError("El pedido no tiene ítems, no hay nada que cobrar")
 
     fecha = fecha or date.today().isoformat()
+    comision = mod_caja.calcular_comision(detalle["total"], medio_pago)
 
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE pedidos SET estado = 'entregado', pagado = 1, medio_pago = ? WHERE id = ?",
+            "UPDATE pedidos SET estado = 'entregado', pagado = TRUE, medio_pago = %s WHERE id = %s",
             (medio_pago, pedido_id),
         )
+
+        movimiento_ingreso_id = mod_caja.registrar_movimiento(
+            "ingreso", detalle["total"], medio_pago,
+            categoria="Pedido",
+            descripcion=f"Pedido #{pedido_id} - {detalle['cliente_nombre']}",
+            fecha=fecha,
+            conn=conn,
+        )
+
+        movimiento_gasto_comision_id = None
+        if comision > 0:
+            movimiento_gasto_comision_id = mod_caja.registrar_movimiento(
+                "gasto", comision, medio_pago,
+                categoria="Comisión Mercado Pago",
+                descripcion=f"Comisión {medio_pago} - Pedido #{pedido_id} - {detalle['cliente_nombre']}",
+                fecha=fecha,
+                conn=conn,
+            )
+
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
-
-    movimiento_ingreso_id = mod_caja.registrar_movimiento(
-        "ingreso", detalle["total"], medio_pago,
-        categoria="Pedido",
-        descripcion=f"Pedido #{pedido_id} - {detalle['cliente_nombre']}",
-        fecha=fecha,
-    )
-
-    comision = mod_caja.calcular_comision(detalle["total"], medio_pago)
-    movimiento_gasto_comision_id = None
-    if comision > 0:
-        movimiento_gasto_comision_id = mod_caja.registrar_movimiento(
-            "gasto", comision, medio_pago,
-            categoria="Comisión Mercado Pago",
-            descripcion=f"Comisión {medio_pago} - Pedido #{pedido_id} - {detalle['cliente_nombre']}",
-            fecha=fecha,
-        )
 
     return {
         "movimiento_ingreso_id": movimiento_ingreso_id,
@@ -409,7 +422,7 @@ def reporte_productos_populares(limite: int = 10) -> list[dict]:
                WHERE p.estado != 'cancelado'
                GROUP BY r.id
                ORDER BY unidades_pedidas DESC
-               LIMIT ?""",
+               LIMIT %s""",
             (limite,),
         ).fetchall()
     finally:

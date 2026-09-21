@@ -35,7 +35,7 @@ def actualizar_configuracion(horas_disponibles_dia: float) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE configuracion_produccion SET horas_disponibles_dia = ? WHERE id = 1",
+            "UPDATE configuracion_produccion SET horas_disponibles_dia = %s WHERE id = 1",
             (horas_disponibles_dia,),
         )
         conn.commit()
@@ -52,11 +52,11 @@ def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) ->
         FROM pedido_items pi
         JOIN pedidos p ON p.id = pi.pedido_id
         JOIN recetas r ON r.id = pi.receta_id
-        WHERE p.fecha_entrega = ? AND p.estado != 'cancelado'
+        WHERE p.fecha_entrega = %s AND p.estado != 'cancelado'
     """
     parametros = [fecha]
     if excluir_pedido_id is not None:
-        query += " AND p.id != ?"
+        query += " AND p.id != %s"
         parametros.append(excluir_pedido_id)
 
     conn = conectar()
@@ -96,7 +96,7 @@ def verificar_disponibilidad(fecha: str, receta_id: int, cantidad: float,
     conn = conectar()
     try:
         receta = conn.execute(
-            "SELECT tiempo_preparacion_min, unidades_por_lote FROM recetas WHERE id = ?",
+            "SELECT tiempo_preparacion_min, unidades_por_lote FROM recetas WHERE id = %s",
             (receta_id,),
         ).fetchone()
     finally:

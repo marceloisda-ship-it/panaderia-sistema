@@ -30,13 +30,14 @@ def agregar_ingrediente(nombre: str, unidad_base: str, precio_actual: float,
         cursor = conn.cursor()
         cursor.execute(
             """INSERT INTO ingredientes (nombre, unidad_base, precio_actual, proveedor, fecha_actualizacion)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id""",
             (nombre, unidad_base, precio_actual, proveedor, fecha),
         )
-        ingrediente_id = cursor.lastrowid
+        ingrediente_id = cursor.fetchone()["id"]
         cursor.execute(
             """INSERT INTO historial_precios_ingredientes (ingrediente_id, precio, fecha)
-               VALUES (?, ?, ?)""",
+               VALUES (%s, %s, %s)""",
             (ingrediente_id, precio_actual, fecha),
         )
         conn.commit()
@@ -58,17 +59,17 @@ def actualizar_precio(ingrediente_id: int, nuevo_precio: float) -> None:
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM ingredientes WHERE id = ?", (ingrediente_id,))
+        cursor.execute("SELECT id FROM ingredientes WHERE id = %s", (ingrediente_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
 
         cursor.execute(
-            "UPDATE ingredientes SET precio_actual = ?, fecha_actualizacion = ? WHERE id = ?",
+            "UPDATE ingredientes SET precio_actual = %s, fecha_actualizacion = %s WHERE id = %s",
             (nuevo_precio, fecha, ingrediente_id),
         )
         cursor.execute(
             """INSERT INTO historial_precios_ingredientes (ingrediente_id, precio, fecha)
-               VALUES (?, ?, ?)""",
+               VALUES (%s, %s, %s)""",
             (ingrediente_id, nuevo_precio, fecha),
         )
         conn.commit()
@@ -93,7 +94,7 @@ def buscar_ingrediente_por_nombre(nombre: str) -> dict | None:
     conn = conectar()
     try:
         fila = conn.execute(
-            "SELECT * FROM ingredientes WHERE nombre = ?", (nombre,)
+            "SELECT * FROM ingredientes WHERE nombre = %s", (nombre,)
         ).fetchone()
         return dict(fila) if fila else None
     finally:
@@ -106,7 +107,7 @@ def historial_de_precio(ingrediente_id: int) -> list[dict]:
     try:
         filas = conn.execute(
             """SELECT id, precio, fecha FROM historial_precios_ingredientes
-               WHERE ingrediente_id = ? ORDER BY fecha ASC""",
+               WHERE ingrediente_id = %s ORDER BY fecha ASC""",
             (ingrediente_id,),
         ).fetchall()
         return [dict(f) for f in filas]
@@ -121,10 +122,10 @@ def eliminar_registro_historial(historial_id: int) -> None:
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM historial_precios_ingredientes WHERE id = ?", (historial_id,))
+        cursor.execute("SELECT id FROM historial_precios_ingredientes WHERE id = %s", (historial_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un registro de historial con id {historial_id}")
-        cursor.execute("DELETE FROM historial_precios_ingredientes WHERE id = ?", (historial_id,))
+        cursor.execute("DELETE FROM historial_precios_ingredientes WHERE id = %s", (historial_id,))
         conn.commit()
     finally:
         conn.close()
@@ -136,11 +137,11 @@ def actualizar_proveedor(ingrediente_id: int, nuevo_proveedor: str | None) -> No
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM ingredientes WHERE id = ?", (ingrediente_id,))
+        cursor.execute("SELECT id FROM ingredientes WHERE id = %s", (ingrediente_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
         cursor.execute(
-            "UPDATE ingredientes SET proveedor = ? WHERE id = ?",
+            "UPDATE ingredientes SET proveedor = %s WHERE id = %s",
             (nuevo_proveedor or None, ingrediente_id),
         )
         conn.commit()
@@ -157,7 +158,7 @@ def recetas_que_usan_ingrediente(ingrediente_id: int) -> list[dict]:
             """SELECT r.id, r.nombre
                FROM receta_ingredientes ri
                JOIN recetas r ON r.id = ri.receta_id
-               WHERE ri.ingrediente_id = ?
+               WHERE ri.ingrediente_id = %s
                ORDER BY r.nombre ASC""",
             (ingrediente_id,),
         ).fetchall()
@@ -174,18 +175,18 @@ def eliminar_ingrediente(ingrediente_id: int) -> None:
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM ingredientes WHERE id = ?", (ingrediente_id,))
+        cursor.execute("SELECT id FROM ingredientes WHERE id = %s", (ingrediente_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
 
-        cursor.execute("DELETE FROM ingredientes WHERE id = ?", (ingrediente_id,))
+        cursor.execute("DELETE FROM ingredientes WHERE id = %s", (ingrediente_id,))
         conn.commit()
     except ValueError:
         raise
-    except Exception:
+    except Exception as exc:
         conn.rollback()
         raise ValueError(
             "No se puede eliminar: este ingrediente está siendo usado en una o más recetas."
-        )
+        ) from exc
     finally:
         conn.close()

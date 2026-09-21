@@ -54,12 +54,14 @@ def crear_receta(nombre: str, precio_venta: float, margen_objetivo: float = 0.4,
         cursor.execute(
             """INSERT INTO recetas (nombre, precio_venta, margen_objetivo, notas,
                                      tiempo_preparacion_min, unidades_por_lote, consumo_kwh_programa)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               RETURNING id""",
             (nombre, precio_venta, margen_objetivo, notas, tiempo_preparacion_min,
              unidades_por_lote, consumo_kwh_programa),
         )
+        receta_id = cursor.fetchone()["id"]
         conn.commit()
-        return cursor.lastrowid
+        return receta_id
     finally:
         conn.close()
 
@@ -75,7 +77,7 @@ def actualizar_mano_obra(receta_id: int, tiempo_preparacion_min: float, unidades
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE recetas SET tiempo_preparacion_min = ?, unidades_por_lote = ? WHERE id = ?",
+            "UPDATE recetas SET tiempo_preparacion_min = %s, unidades_por_lote = %s WHERE id = %s",
             (tiempo_preparacion_min, unidades_por_lote, receta_id),
         )
         conn.commit()
@@ -92,7 +94,7 @@ def actualizar_luz(receta_id: int, consumo_kwh_programa: float) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE recetas SET consumo_kwh_programa = ? WHERE id = ?",
+            "UPDATE recetas SET consumo_kwh_programa = %s WHERE id = %s",
             (consumo_kwh_programa, receta_id),
         )
         conn.commit()
@@ -112,8 +114,8 @@ def agregar_ingrediente_a_receta(receta_id: int, ingrediente_id: int, cantidad: 
     try:
         conn.execute(
             """INSERT INTO receta_ingredientes (receta_id, ingrediente_id, cantidad)
-               VALUES (?, ?, ?)
-               ON CONFLICT(receta_id, ingrediente_id)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (receta_id, ingrediente_id)
                DO UPDATE SET cantidad = excluded.cantidad""",
             (receta_id, ingrediente_id, cantidad),
         )
@@ -127,7 +129,7 @@ def quitar_ingrediente_de_receta(receta_id: int, ingrediente_id: int) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "DELETE FROM receta_ingredientes WHERE receta_id = ? AND ingrediente_id = ?",
+            "DELETE FROM receta_ingredientes WHERE receta_id = %s AND ingrediente_id = %s",
             (receta_id, ingrediente_id),
         )
         conn.commit()
@@ -136,7 +138,7 @@ def quitar_ingrediente_de_receta(receta_id: int, ingrediente_id: int) -> None:
 
 
 def _obtener_receta(conn, receta_id: int) -> dict:
-    fila = conn.execute("SELECT * FROM recetas WHERE id = ?", (receta_id,)).fetchone()
+    fila = conn.execute("SELECT * FROM recetas WHERE id = %s", (receta_id,)).fetchone()
     if fila is None:
         raise ValueError(f"No existe una receta con id {receta_id}")
     return dict(fila)
@@ -154,7 +156,7 @@ def detalle_receta(receta_id: int) -> dict:
             """SELECT i.nombre, i.unidad_base, i.precio_actual, ri.cantidad
                FROM receta_ingredientes ri
                JOIN ingredientes i ON i.id = ri.ingrediente_id
-               WHERE ri.receta_id = ?
+               WHERE ri.receta_id = %s
                ORDER BY i.nombre ASC""",
             (receta_id,),
         ).fetchall()
@@ -225,7 +227,7 @@ def listar_recetas(solo_activas: bool = True) -> list[dict]:
     try:
         query = "SELECT id FROM recetas"
         if solo_activas:
-            query += " WHERE activo = 1"
+            query += " WHERE activo = TRUE"
         query += " ORDER BY nombre ASC"
         ids = [f["id"] for f in conn.execute(query).fetchall()]
     finally:
@@ -240,7 +242,7 @@ def actualizar_precio_venta(receta_id: int, nuevo_precio: float) -> None:
         raise ValueError("El precio de venta no puede ser negativo")
     conn = conectar()
     try:
-        conn.execute("UPDATE recetas SET precio_venta = ? WHERE id = ?", (nuevo_precio, receta_id))
+        conn.execute("UPDATE recetas SET precio_venta = %s WHERE id = %s", (nuevo_precio, receta_id))
         conn.commit()
     finally:
         conn.close()
@@ -252,7 +254,7 @@ def actualizar_margen_objetivo(receta_id: int, nuevo_margen: float) -> None:
         raise ValueError("El margen debe ser un valor entre 0 y 1 (ej. 0.4 = 40%)")
     conn = conectar()
     try:
-        conn.execute("UPDATE recetas SET margen_objetivo = ? WHERE id = ?", (nuevo_margen, receta_id))
+        conn.execute("UPDATE recetas SET margen_objetivo = %s WHERE id = %s", (nuevo_margen, receta_id))
         conn.commit()
     finally:
         conn.close()
