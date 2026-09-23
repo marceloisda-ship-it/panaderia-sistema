@@ -8,25 +8,41 @@ que el equipo pueda usar el sistema desde varios dispositivos a la vez.
 La cadena de conexión se lee desde `st.secrets["postgres"]["url"]`
 (ver .streamlit/secrets.toml en desarrollo, o los "Secrets" del panel
 de Streamlit Community Cloud en producción) — nunca queda en el código.
+
+Las conexiones salen de un pool cacheado a nivel de proceso (no se abre
+una conexión TCP/TLS nueva contra Supabase en cada `conectar()`, que
+sale ~800ms por el handshake — con el pool baja a ~10-20ms).
 """
+
+import uuid
 
 import streamlit as st
 import psycopg2
 import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
 
 class _ConexionConExecute:
-    """Envuelve una conexión psycopg2 para agregarle un método `.execute()`
-    a nivel de conexión, igual que trae sqlite3 nativamente. psycopg2 solo
-    permite ejecutar consultas desde un cursor — sin este envoltorio,
-    habría que reescribir cada `conn.execute(...)` de los 8 módulos de
-    negocio por `cursor = conn.cursor(); cursor.execute(...)`. Todo lo
-    demás (placeholders %s, RETURNING en vez de lastrowid, etc.) sí hubo
-    que ajustarlo módulo por módulo — esto solo evita ese cambio en
-    particular, que era puramente mecánico."""
+    """Envuelve una conexión psycopg2 tomada del pool para agregarle un
+    método `.execute()` a nivel de conexión, igual que trae sqlite3
+    nativamente. psycopg2 solo permite ejecutar consultas desde un
+    cursor — sin este envoltorio, habría que reescribir cada
+    `conn.execute(...)` de los 8 módulos de negocio por
+    `cursor = conn.cursor(); cursor.execute(...)`. Todo lo demás
+    (placeholders %s, RETURNING en vez de lastrowid, etc.) sí hubo que
+    ajustarlo módulo por módulo — esto solo evita ese cambio en
+    particular, que era puramente mecánico.
 
-    def __init__(self, conn):
+    `close()` no cierra la conexión TCP: la devuelve al pool para que
+    la reutilice el próximo `conectar()`. Antes de devolverla, hace
+    rollback por las dudas (si el caller ya hizo commit, es un no-op;
+    si quedó una transacción de solo lectura sin cerrar, la descarta),
+    para que la conexión vuelva al pool en estado limpio."""
+
+    def __init__(self, conn, pool, clave):
         self._conn = conn
+        self._pool = pool
+        self._clave = clave
 
     def execute(self, query, params=None):
         cursor = self._conn.cursor()
@@ -43,21 +59,37 @@ class _ConexionConExecute:
         self._conn.rollback()
 
     def close(self):
-        self._conn.close()
+        try:
+            self._conn.rollback()
+        except psycopg2.Error:
+            pass
+        self._pool.putconn(self._conn, key=self._clave, close=self._conn.closed != 0)
+
+
+@st.cache_resource
+def _pool() -> ThreadedConnectionPool:
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=st.secrets["postgres"]["url"],
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
 
 
 def conectar() -> _ConexionConExecute:
-    """Abre y retorna una conexión a la base de datos Postgres (Supabase).
+    """Toma una conexión del pool (no abre una nueva contra Supabase
+    salvo que el pool todavía no tenga ninguna libre) y la retorna
+    envuelta para poder seguir usando `fila["campo"]` y `.execute()`
+    como con sqlite3.
 
-    Se usa `RealDictCursor` para poder seguir accediendo a las columnas
-    de los resultados por nombre (ej. fila["nombre"]), igual que con
-    sqlite3.Row en la versión anterior local.
+    Cada llamada usa una clave propia (no la comparte por hilo) para
+    que dos `conectar()` seguidos dentro del mismo render de Streamlit
+    tomen conexiones independientes del pool, sin pisarse si alguna
+    quedara abierta más tiempo que otra.
     """
-    conn = psycopg2.connect(
-        st.secrets["postgres"]["url"],
-        cursor_factory=psycopg2.extras.RealDictCursor,
-    )
-    return _ConexionConExecute(conn)
+    clave = uuid.uuid4().hex
+    conn = _pool().getconn(key=clave)
+    return _ConexionConExecute(conn, _pool(), clave)
 
 
 def inicializar_db() -> None:
@@ -228,5 +260,4 @@ def inicializar_db() -> None:
     """)
 
     conn.commit()
-    cursor.close()
     conn.close()

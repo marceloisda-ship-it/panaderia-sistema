@@ -15,6 +15,7 @@ import pandas as pd
 import streamlit as st
 
 from db import inicializar_db
+import auth
 import ingredientes as mod_ing
 import recetas as mod_rec
 import caja as mod_caja
@@ -25,7 +26,25 @@ import clientes as mod_clientes
 import dashboard as mod_dash
 
 st.set_page_config(page_title="Panadería · Gestión", page_icon="🥖", layout="wide")
-inicializar_db()
+
+if not st.session_state.get("usuario"):
+    auth.mostrar_login()
+    st.stop()
+
+
+@st.cache_resource
+def _inicializar_db_una_vez():
+    # Streamlit vuelve a ejecutar todo este script en cada interacción
+    # (incluido cambiar de pestaña en el sidebar) — sin este cache,
+    # inicializar_db() mandaría ~14 sentencias SQL (crear las 11 tablas +
+    # 3 inserts de configuración) contra Supabase en cada click, aunque
+    # el esquema ya exista (~2s de más por navegación). Con @st.cache_resource
+    # corre una sola vez por proceso, no una vez por rerun.
+    inicializar_db()
+    return True
+
+
+_inicializar_db_una_vez()
 
 
 # --- Helpers comunes -----------------------------------------------------
@@ -1211,6 +1230,7 @@ def seccion_dashboard():
 # --- Navegación principal ------------------------------------------------
 
 st.sidebar.title("🥖 Panadería")
+auth.mostrar_sesion_activa()
 seccion = st.sidebar.radio(
     "Módulo",
     ["Dashboard", "Ingredientes", "Recetas", "Flujo de caja", "Costos indirectos", "Pedidos", "Clientes"],

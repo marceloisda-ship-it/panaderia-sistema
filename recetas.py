@@ -144,6 +144,68 @@ def _obtener_receta(conn, receta_id: int) -> dict:
     return dict(fila)
 
 
+def _calcular_costo(receta: dict, filas_ingredientes: list, config: dict) -> dict:
+    """Cálculo puro (sin acceso a datos) del costo/margen de una receta a
+    partir de sus filas de ingredientes y la configuración de costos
+    indirectos ya traídas. Separado de `detalle_receta`/`listar_recetas`
+    para poder traer los datos de a una receta (lookup individual) o de
+    todas de una vez (listado, evitando N+1 contra Supabase)."""
+    ingredientes = []
+    costo_directo = 0.0
+    for f in filas_ingredientes:
+        subtotal = f["cantidad"] * f["precio_actual"]
+        costo_directo += subtotal
+        ingredientes.append({
+            "nombre": f["nombre"],
+            "cantidad": f["cantidad"],
+            "unidad_base": f["unidad_base"],
+            "precio_unitario": f["precio_actual"],
+            "subtotal": round(subtotal, 2),
+        })
+
+    # La luz NO se divide por unidades_por_lote: cada pan se hornea en su
+    # propia panificadora con su propio ciclo completo, así que el
+    # consumo eléctrico no se abarata por preparar varios panes en la
+    # misma sesión de trabajo (a diferencia de la mano de obra, que sí
+    # se reparte porque el tiempo activo de preparación es compartido).
+    costo_indirecto_luz = (
+        receta["consumo_kwh_programa"] * config["tarifa_electrica_kwh"] * config["factor_descuento_luz"]
+    )
+    costo_empaque = config["costo_empaque_unidad"]
+    costo_mano_obra = (
+        receta["tiempo_preparacion_min"] / 60 * config["valor_hora_mano_obra"]
+        / receta["unidades_por_lote"]
+    )
+    costo_total = costo_directo + costo_indirecto_luz + costo_empaque + costo_mano_obra
+
+    precio_venta = receta["precio_venta"]
+    if precio_venta > 0:
+        margen_real = (precio_venta - costo_total) / precio_venta
+    else:
+        margen_real = 0.0
+
+    return {
+        "id": receta["id"],
+        "nombre": receta["nombre"],
+        "precio_venta": precio_venta,
+        "margen_objetivo": receta["margen_objetivo"],
+        "activo": bool(receta["activo"]),
+        "notas": receta["notas"],
+        "tiempo_preparacion_min": receta["tiempo_preparacion_min"],
+        "unidades_por_lote": receta["unidades_por_lote"],
+        "consumo_kwh_programa": receta["consumo_kwh_programa"],
+        "ingredientes": ingredientes,
+        "costo_directo": round(costo_directo, 2),
+        "costo_indirecto_luz": round(costo_indirecto_luz, 2),
+        "costo_empaque": round(costo_empaque, 2),
+        "costo_mano_obra": round(costo_mano_obra, 2),
+        "costo_total": round(costo_total, 2),
+        "ganancia": round(precio_venta - costo_total, 2),
+        "margen_real": round(margen_real, 4),
+        "bajo_margen": margen_real < receta["margen_objetivo"],
+    }
+
+
 def detalle_receta(receta_id: int) -> dict:
     """Retorna el detalle completo de una receta: datos generales,
     lista de ingredientes, desglose de costo directo e indirecto,
@@ -160,80 +222,47 @@ def detalle_receta(receta_id: int) -> dict:
                ORDER BY i.nombre ASC""",
             (receta_id,),
         ).fetchall()
-
-        ingredientes = []
-        costo_directo = 0.0
-        for f in filas:
-            subtotal = f["cantidad"] * f["precio_actual"]
-            costo_directo += subtotal
-            ingredientes.append({
-                "nombre": f["nombre"],
-                "cantidad": f["cantidad"],
-                "unidad_base": f["unidad_base"],
-                "precio_unitario": f["precio_actual"],
-                "subtotal": round(subtotal, 2),
-            })
-
-        config = costos_indirectos.obtener_configuracion()
-        # La luz NO se divide por unidades_por_lote: cada pan se hornea en su
-        # propia panificadora con su propio ciclo completo, así que el
-        # consumo eléctrico no se abarata por preparar varios panes en la
-        # misma sesión de trabajo (a diferencia de la mano de obra, que sí
-        # se reparte porque el tiempo activo de preparación es compartido).
-        costo_indirecto_luz = (
-            receta["consumo_kwh_programa"] * config["tarifa_electrica_kwh"] * config["factor_descuento_luz"]
-        )
-        costo_empaque = config["costo_empaque_unidad"]
-        costo_mano_obra = (
-            receta["tiempo_preparacion_min"] / 60 * config["valor_hora_mano_obra"]
-            / receta["unidades_por_lote"]
-        )
-        costo_total = costo_directo + costo_indirecto_luz + costo_empaque + costo_mano_obra
-
-        precio_venta = receta["precio_venta"]
-        if precio_venta > 0:
-            margen_real = (precio_venta - costo_total) / precio_venta
-        else:
-            margen_real = 0.0
-
-        return {
-            "id": receta["id"],
-            "nombre": receta["nombre"],
-            "precio_venta": precio_venta,
-            "margen_objetivo": receta["margen_objetivo"],
-            "activo": bool(receta["activo"]),
-            "notas": receta["notas"],
-            "tiempo_preparacion_min": receta["tiempo_preparacion_min"],
-            "unidades_por_lote": receta["unidades_por_lote"],
-            "consumo_kwh_programa": receta["consumo_kwh_programa"],
-            "ingredientes": ingredientes,
-            "costo_directo": round(costo_directo, 2),
-            "costo_indirecto_luz": round(costo_indirecto_luz, 2),
-            "costo_empaque": round(costo_empaque, 2),
-            "costo_mano_obra": round(costo_mano_obra, 2),
-            "costo_total": round(costo_total, 2),
-            "ganancia": round(precio_venta - costo_total, 2),
-            "margen_real": round(margen_real, 4),
-            "bajo_margen": margen_real < receta["margen_objetivo"],
-        }
     finally:
         conn.close()
+
+    config = costos_indirectos.obtener_configuracion()
+    return _calcular_costo(receta, filas, config)
 
 
 def listar_recetas(solo_activas: bool = True) -> list[dict]:
     """Retorna todas las recetas con su costo y margen ya calculados.
-    Útil para el reporte general de rentabilidad."""
+    Útil para el reporte general de rentabilidad.
+
+    Trae las recetas y sus ingredientes en 2 consultas (no 1 por receta) y
+    reutiliza una sola conexión — con SQLite local esto no importaba, pero
+    contra Supabase cada conexión de más suma latencia de red real."""
+    query = "SELECT * FROM recetas"
+    if solo_activas:
+        query += " WHERE activo = TRUE"
+    query += " ORDER BY nombre ASC"
+
     conn = conectar()
     try:
-        query = "SELECT id FROM recetas"
-        if solo_activas:
-            query += " WHERE activo = TRUE"
-        query += " ORDER BY nombre ASC"
-        ids = [f["id"] for f in conn.execute(query).fetchall()]
+        recetas = [dict(f) for f in conn.execute(query).fetchall()]
+        ids = [r["id"] for r in recetas]
+
+        ingredientes_por_receta = {rid: [] for rid in ids}
+        if ids:
+            filas = conn.execute(
+                """SELECT ri.receta_id, i.nombre, i.unidad_base, i.precio_actual, ri.cantidad
+                   FROM receta_ingredientes ri
+                   JOIN ingredientes i ON i.id = ri.ingrediente_id
+                   WHERE ri.receta_id = ANY(%s)
+                   ORDER BY i.nombre ASC""",
+                (ids,),
+            ).fetchall()
+            for f in filas:
+                ingredientes_por_receta[f["receta_id"]].append(f)
     finally:
         conn.close()
 
-    return [detalle_receta(receta_id) for receta_id in ids]
+    config = costos_indirectos.obtener_configuracion()
+    return [_calcular_costo(r, ingredientes_por_receta[r["id"]], config) for r in recetas]
 
 
 def actualizar_precio_venta(receta_id: int, nuevo_precio: float) -> None:

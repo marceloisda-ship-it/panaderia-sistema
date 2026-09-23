@@ -215,31 +215,65 @@ def generar_mensaje_datos_transferencia_whatsapp(nombre: str, rut: str, tipo_cue
 def listar_pedidos(desde: str | None = None, hasta: str | None = None,
                     estado: str | None = None) -> list[dict]:
     """Lista pedidos (con su total ya calculado), por fecha de entrega
-    ascendente. Filtros opcionales por rango de fecha_entrega y estado."""
+    ascendente. Filtros opcionales por rango de fecha_entrega y estado.
+
+    Trae los pedidos y sus ítems en 2 consultas (no 1 por pedido llamando
+    a `detalle_pedido`) y reutiliza una sola conexión — con SQLite local
+    esto no importaba, pero contra Supabase cada conexión de más suma
+    latencia de red real, y esta función se llama seguido (dashboard,
+    resúmenes de días, la sección de Pedidos)."""
     condiciones = []
     parametros = []
     if desde:
-        condiciones.append("fecha_entrega >= %s")
+        condiciones.append("p.fecha_entrega >= %s")
         parametros.append(desde)
     if hasta:
-        condiciones.append("fecha_entrega <= %s")
+        condiciones.append("p.fecha_entrega <= %s")
         parametros.append(hasta)
     if estado:
-        condiciones.append("estado = %s")
+        condiciones.append("p.estado = %s")
         parametros.append(estado)
 
-    query = "SELECT id FROM pedidos"
+    query = """SELECT p.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
+               FROM pedidos p
+               JOIN clientes c ON c.id = p.cliente_id"""
     if condiciones:
         query += " WHERE " + " AND ".join(condiciones)
-    query += " ORDER BY fecha_entrega ASC, id ASC"
+    query += " ORDER BY p.fecha_entrega ASC, p.id ASC"
 
     conn = conectar()
     try:
-        ids = [f["id"] for f in conn.execute(query, parametros).fetchall()]
+        pedidos = [dict(f) for f in conn.execute(query, parametros).fetchall()]
+        ids = [p["id"] for p in pedidos]
+
+        items_por_pedido = {pid: [] for pid in ids}
+        if ids:
+            filas_items = conn.execute(
+                """SELECT pi.pedido_id, r.nombre, pi.receta_id, pi.cantidad, pi.precio_unitario
+                   FROM pedido_items pi
+                   JOIN recetas r ON r.id = pi.receta_id
+                   WHERE pi.pedido_id = ANY(%s)
+                   ORDER BY r.nombre ASC""",
+                (ids,),
+            ).fetchall()
+            for f in filas_items:
+                subtotal = f["cantidad"] * f["precio_unitario"]
+                items_por_pedido[f["pedido_id"]].append({
+                    "receta_id": f["receta_id"],
+                    "nombre": f["nombre"],
+                    "cantidad": f["cantidad"],
+                    "precio_unitario": f["precio_unitario"],
+                    "subtotal": round(subtotal, 2),
+                })
     finally:
         conn.close()
 
-    return [detalle_pedido(pid) for pid in ids]
+    for p in pedidos:
+        p["items"] = items_por_pedido[p["id"]]
+        p["total"] = round(sum(i["subtotal"] for i in p["items"]), 2)
+        p["pagado"] = bool(p["pagado"])
+
+    return pedidos
 
 
 def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
