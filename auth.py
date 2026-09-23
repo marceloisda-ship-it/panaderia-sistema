@@ -35,14 +35,12 @@ def mostrar_login():
             resultado = _cliente().auth.sign_in_with_password({"email": email, "password": password})
             st.session_state["usuario"] = {"email": resultado.user.email, "id": resultado.user.id}
             st.rerun()
-        except Exception as e:
+        except Exception:
             # Log del error real (visible en "Manage app" → logs de Streamlit
-            # Cloud) para poder diagnosticar sin exponer detalles al usuario
-            # que está intentando entrar (que solo ve el mensaje genérico).
+            # Cloud) para poder diagnosticar sin exponer detalles a quien
+            # está intentando entrar (que solo ve el mensaje genérico).
             logger.exception("Fallo al iniciar sesión con email=%r", email)
             st.error("Correo o contraseña incorrectos.")
-            with st.expander("Detalle técnico (para diagnóstico)"):
-                st.code(f"{type(e).__name__}: {e}")
 
 
 def mostrar_sesion_activa():
