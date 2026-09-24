@@ -611,11 +611,18 @@ def seccion_costos_indirectos():
 
 def seccion_pedidos():
     st.header("📋 Pedidos")
-    tab_planificacion, tab_agenda, tab_crear, tab_items, tab_detalle, tab_capacidad = st.tabs(
-        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Capacidad de producción"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son decenas de
+    # consultas por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Capacidad de producción"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_pedidos",
     )
 
-    with tab_planificacion:
+    if vista == "Planificación":
         st.subheader("Próximos días")
         dias = st.slider("Ver los próximos... días", min_value=7, max_value=30, value=14, key="dias_planificacion")
         resumen_dias = mod_pedidos.resumen_proximos_dias(dias)
@@ -655,7 +662,7 @@ def seccion_pedidos():
         else:
             st.info("No hay pedidos para este día.")
 
-    with tab_agenda:
+    elif vista == "Agenda":
         col1, col2, col3 = st.columns(3)
         desde = col1.date_input("Desde", value=None, key="ped_desde")
         hasta = col2.date_input("Hasta", value=None, key="ped_hasta")
@@ -743,7 +750,7 @@ def seccion_pedidos():
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_crear:
+    elif vista == "Crear pedido":
         clientes_existentes = mod_clientes.listar_clientes()
         modo_cliente = st.radio(
             "Cliente",
@@ -831,7 +838,7 @@ def seccion_pedidos():
                     del st.session_state["pedido_en_construccion"]
                     st.rerun()
 
-    with tab_items:
+    elif vista == "Agregar ítems":
         pedido_id = selector_pedido("Pedido", "sel_pedido_items")
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
@@ -880,7 +887,7 @@ def seccion_pedidos():
                         except Exception as e:
                             mostrar_error(e)
 
-    with tab_detalle:
+    elif vista == "Detalle / Cobrar":
         opciones_estado_detalle = list(mod_pedidos.ESTADOS_VALIDOS) + ["(todos)"]
         estado_filtro_detalle = st.selectbox(
             "Filtrar por estado", opciones_estado_detalle, index=0, key="detalle_filtro_estado"
@@ -1015,7 +1022,7 @@ def seccion_pedidos():
                     except Exception as e:
                         mostrar_error(e)
 
-    with tab_capacidad:
+    elif vista == "Capacidad de producción":
         config = mod_prod.obtener_configuracion()
         with st.form("form_capacidad"):
             horas = st.number_input(
