@@ -102,11 +102,18 @@ def selector_pedido(label: str, key: str, estado: str | None = None):
 
 def seccion_ingredientes():
     st.header("🧂 Ingredientes")
-    tab_listado, tab_agregar, tab_precio, tab_historial, tab_eliminar = st.tabs(
-        ["Listado", "Agregar", "Actualizar precio", "Historial de precio", "Eliminar"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Listado", "Agregar", "Actualizar precio", "Historial de precio", "Eliminar"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_ingredientes",
     )
 
-    with tab_listado:
+    if vista == "Listado":
         ings = mod_ing.listar_ingredientes()
         if not ings:
             st.info("No hay ingredientes cargados todavía.")
@@ -122,7 +129,7 @@ def seccion_ingredientes():
                 ]
                 st.dataframe(df, width='stretch', hide_index=True)
 
-    with tab_agregar:
+    elif vista == "Agregar":
         with st.form("form_agregar_ingrediente", clear_on_submit=True):
             nombre = st.text_input("Nombre (ej. Harina 000)")
             unidad = st.selectbox("Unidad base", ["gr", "ml", "unidad"])
@@ -136,7 +143,7 @@ def seccion_ingredientes():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_precio:
+    elif vista == "Actualizar precio":
         ing_id, ing = selector_ingrediente("Ingrediente a actualizar", "sel_precio")
         if ing_id is not None:
             st.caption(f"Precio actual: ${ing['precio_actual']:.2f} / {ing['unidad_base']}")
@@ -164,7 +171,7 @@ def seccion_ingredientes():
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_historial:
+    elif vista == "Historial de precio":
         ing_id, _ = selector_ingrediente("Ingrediente", "sel_historial")
         if ing_id is not None:
             historial = mod_ing.historial_de_precio(ing_id)
@@ -189,7 +196,7 @@ def seccion_ingredientes():
                     except Exception as e:
                         mostrar_error(e)
 
-    with tab_eliminar:
+    elif vista == "Eliminar":
         ing_id, ing = selector_ingrediente("Ingrediente a eliminar", "sel_eliminar_ing")
         if ing_id is not None:
             st.caption(
@@ -440,8 +447,15 @@ def seccion_recetas():
 
 def seccion_caja():
     st.header("💰 Flujo de caja")
-    tab_ingreso, tab_gasto, tab_movs, tab_reporte, tab_comisiones = st.tabs(
-        ["Registrar ingreso", "Registrar gasto", "Movimientos", "Reporte por período", "Comisiones"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Registrar ingreso", "Registrar gasto", "Movimientos", "Reporte por período", "Comisiones"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_caja",
     )
 
     def form_movimiento(tipo: str, key_prefix: str):
@@ -461,13 +475,13 @@ def seccion_caja():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ingreso:
+    if vista == "Registrar ingreso":
         form_movimiento("ingreso", "ingreso")
 
-    with tab_gasto:
+    elif vista == "Registrar gasto":
         form_movimiento("gasto", "gasto")
 
-    with tab_movs:
+    elif vista == "Movimientos":
         col1, col2 = st.columns(2)
         desde = col1.date_input("Desde", value=None, key="movs_desde")
         hasta = col2.date_input("Hasta", value=None, key="movs_hasta")
@@ -490,7 +504,7 @@ def seccion_caja():
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_reporte:
+    elif vista == "Reporte por período":
         col1, col2 = st.columns(2)
         desde = col1.date_input("Desde", value=None, key="rep_desde")
         hasta = col2.date_input("Hasta", value=None, key="rep_hasta")
@@ -519,7 +533,7 @@ def seccion_caja():
             else:
                 st.dataframe(df_cat, width='stretch')
 
-    with tab_comisiones:
+    elif vista == "Comisiones":
         st.caption(
             "Tasas que cobra el medio de pago electrónico (ej. Mercado Pago Point) al "
             "cobrar con tarjeta. Al marcar un pedido como 'entregado y cobrado' con débito "
@@ -1060,11 +1074,18 @@ def seccion_pedidos():
 
 def seccion_clientes():
     st.header("👥 Clientes")
-    tab_listado, tab_agregar, tab_ficha, tab_reportes = st.tabs(
-        ["Listado", "Agregar", "Ficha / Historial", "Reportes"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Listado", "Agregar", "Ficha / Historial", "Reportes"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_clientes",
     )
 
-    with tab_listado:
+    if vista == "Listado":
         clientes = mod_clientes.listar_clientes()
         if not clientes:
             st.info("No hay clientes registrados todavía.")
@@ -1072,7 +1093,7 @@ def seccion_clientes():
             df = pd.DataFrame(clientes)[["id", "nombre", "telefono", "direccion", "fecha_creacion"]]
             st.dataframe(df, width='stretch', hide_index=True)
 
-    with tab_agregar:
+    elif vista == "Agregar":
         with st.form("form_agregar_cliente", clear_on_submit=True):
             nombre = st.text_input("Nombre")
             telefono = st.text_input("Teléfono (opcional)")
@@ -1086,7 +1107,7 @@ def seccion_clientes():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ficha:
+    elif vista == "Ficha / Historial":
         cliente_id = selector_cliente("Cliente", "sel_cliente_ficha")
         if cliente_id is not None:
             hist = mod_clientes.historial_cliente(cliente_id)
@@ -1123,7 +1144,7 @@ def seccion_clientes():
             else:
                 st.info("Este cliente todavía no tiene pedidos.")
 
-    with tab_reportes:
+    elif vista == "Reportes":
         col_izq, col_der = st.columns(2)
         with col_izq:
             st.subheader("Quién compra más")
