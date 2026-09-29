@@ -219,11 +219,18 @@ def seccion_ingredientes():
 
 def seccion_recetas():
     st.header("🍞 Recetas")
-    tab_reporte, tab_crear, tab_ingredientes, tab_detalle = st.tabs(
-        ["Reporte de rentabilidad", "Crear receta", "Editar ingredientes", "Detalle de receta"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Reporte de rentabilidad", "Crear receta", "Editar ingredientes", "Detalle de receta"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_recetas",
     )
 
-    with tab_reporte:
+    if vista == "Reporte de rentabilidad":
         solo_activas = st.checkbox("Solo recetas activas", value=True)
         recetas = mod_rec.listar_recetas(solo_activas=solo_activas)
         if not recetas:
@@ -246,7 +253,7 @@ def seccion_recetas():
                 hide_index=True,
             )
 
-    with tab_crear:
+    elif vista == "Crear receta":
         with st.form("form_crear_receta", clear_on_submit=True):
             nombre = st.text_input("Nombre del pan (ej. Marraqueta)")
             precio_venta = st.number_input("Precio de venta", min_value=0.0, step=1.0)
@@ -270,7 +277,7 @@ def seccion_recetas():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ingredientes:
+    elif vista == "Editar ingredientes":
         receta_id = selector_receta("Receta", "sel_receta_ing")
         if receta_id is not None:
             try:
@@ -314,7 +321,7 @@ def seccion_recetas():
                     except Exception as e:
                         mostrar_error(e)
 
-    with tab_detalle:
+    elif vista == "Detalle de receta":
         receta_id = selector_receta("Receta", "sel_receta_detalle")
         if receta_id is not None:
             try:
