@@ -66,7 +66,7 @@ def selector_ingrediente(label: str, key: str):
 
 
 def selector_receta(label: str, key: str, solo_activas: bool = False):
-    recetas = mod_rec.listar_recetas(solo_activas=solo_activas)
+    recetas = mod_rec.listar_recetas_resumen(solo_activas=solo_activas)
     if not recetas:
         st.info("No hay recetas registradas todavía.")
         return None
@@ -86,7 +86,7 @@ def selector_cliente(label: str, key: str):
 
 
 def selector_pedido(label: str, key: str, estado: str | None = None):
-    pedidos = mod_pedidos.listar_pedidos(estado=estado)
+    pedidos = mod_pedidos.listar_pedidos_resumen(estado=estado)
     if not pedidos:
         st.info("No hay pedidos para mostrar.")
         return None

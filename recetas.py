@@ -265,6 +265,27 @@ def listar_recetas(solo_activas: bool = True) -> list[dict]:
     return [_calcular_costo(r, ingredientes_por_receta[r["id"]], config) for r in recetas]
 
 
+def listar_recetas_resumen(solo_activas: bool = False) -> list[dict]:
+    """Retorna solo id y nombre de cada receta, sin calcular costo/margen.
+
+    Pensada para selectores/desplegables (ej. elegir una receta en un
+    formulario), que no necesitan el costeo completo. `listar_recetas()`
+    trae ingredientes y hace el cálculo de costo de cada receta — correcto
+    para el reporte de rentabilidad, pero muy caro para solo mostrar
+    nombres en un `st.selectbox` (cada connect/query de más contra Supabase
+    suma latencia real de red)."""
+    query = "SELECT id, nombre FROM recetas"
+    if solo_activas:
+        query += " WHERE activo = TRUE"
+    query += " ORDER BY nombre ASC"
+
+    conn = conectar()
+    try:
+        return [dict(f) for f in conn.execute(query).fetchall()]
+    finally:
+        conn.close()
+
+
 def actualizar_precio_venta(receta_id: int, nuevo_precio: float) -> None:
     """Actualiza el precio de venta de una receta."""
     if nuevo_precio < 0:

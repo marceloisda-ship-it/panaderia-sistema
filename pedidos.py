@@ -276,6 +276,31 @@ def listar_pedidos(desde: str | None = None, hasta: str | None = None,
     return pedidos
 
 
+def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
+    """Retorna id, cliente, fecha de entrega y estado de cada pedido, sin
+    traer ítems ni calcular el total.
+
+    Pensada para selectores/desplegables (ej. elegir un pedido en un
+    formulario). `listar_pedidos()` trae los ítems de cada pedido con JOIN
+    a recetas — correcto para las vistas que muestran el detalle, pero de
+    más para solo armar una lista de nombres en un `st.selectbox` (cada
+    connect/query de más contra Supabase suma latencia real de red)."""
+    query = """SELECT p.id, p.fecha_entrega, p.estado, c.nombre AS cliente_nombre
+               FROM pedidos p
+               JOIN clientes c ON c.id = p.cliente_id"""
+    parametros = []
+    if estado:
+        query += " WHERE p.estado = %s"
+        parametros.append(estado)
+    query += " ORDER BY p.fecha_entrega ASC, p.id ASC"
+
+    conn = conectar()
+    try:
+        return [dict(f) for f in conn.execute(query, parametros).fetchall()]
+    finally:
+        conn.close()
+
+
 def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
     if nuevo_estado not in ESTADOS_VALIDOS:
         raise ValueError(f"estado debe ser uno de {ESTADOS_VALIDOS}")
