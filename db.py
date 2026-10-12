@@ -259,5 +259,24 @@ def inicializar_db() -> None:
         );
     """)
 
+    # --- Módulo de WhatsApp (ver whatsapp.py) --------------------------------
+    # Historial de cada mensaje de WhatsApp Business enviado por un pedido
+    # (pedido creado, confirmado, recordatorio de pago, pagado), haya salido
+    # bien o mal. Sirve para auditar envíos y para no perder el rastro de un
+    # envío fallido (número inválido, plantilla no aprobada, etc.).
+
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS mensajes_whatsapp (
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            pedido_id INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
+            tipo TEXT NOT NULL CHECK (tipo IN
+                ('pedido_creado', 'pedido_confirmado', 'recordatorio_pago', 'pedido_pagado')),
+            telefono TEXT NOT NULL,
+            estado TEXT NOT NULL CHECK (estado IN ('enviado', 'fallido')),
+            error TEXT,
+            fecha_envio TEXT NOT NULL
+        );
+    """)
+
     conn.commit()
     conn.close()
