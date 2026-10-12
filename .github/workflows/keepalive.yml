@@ -1,0 +1,25 @@
+name: Keep Streamlit app awake
+
+# Visita la app cada 10 minutos, 24/7, para que Streamlit Community Cloud
+# nunca la detecte inactiva y la "duerma". Así se evita el cold start lento
+# que se ve en el primer ingreso del día.
+#
+# Nota: esto hace una petición HTTP simple (curl), no abre un navegador real.
+# Si en la práctica la app sigue durmiéndose (porque Streamlit solo cuenta
+# como "actividad" una conexión de verdad, con el websocket abierto), el
+# siguiente paso sería cambiar este ping por uno con un navegador headless
+# (Playwright) en vez de curl.
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping la app para mantenerla despierta
+        run: |
+          curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 30 --retry 2 \
+            "https://panaderia-sistema-uumamth9pioq35cftmxjuc.streamlit.app/"
