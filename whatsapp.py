@@ -85,10 +85,20 @@ def _formato_pesos(monto: float) -> str:
 
 
 def _bloque_items(items: list[dict]) -> str:
-    return "\n".join(
-        f"- {item['cantidad']} x {item['nombre']} — {_formato_pesos(item['subtotal'])}"
+    # En una sola línea: Meta rechaza variables de plantilla con saltos de
+    # línea, tabs o más de 4 espacios seguidos (error 132018).
+    return " · ".join(
+        f"{item['cantidad']} x {item['nombre']} ({_formato_pesos(item['subtotal'])})"
         for item in items
     )
+
+
+_MEDIOS_PAGO_LEGIBLES = {
+    "efectivo": "efectivo",
+    "debito": "débito",
+    "credito": "crédito",
+    "transferencia": "transferencia",
+}
 
 
 def _fecha_legible(fecha_iso: str) -> str:
@@ -249,7 +259,7 @@ def enviar_pedido_pagado(pedido_id: int, medio_pago: str) -> dict:
             pedido["cliente_nombre"].split()[0],
             str(pedido_id),
             _formato_pesos(pedido["total"]),
-            medio_pago,
+            _MEDIOS_PAGO_LEGIBLES.get(medio_pago, medio_pago),
         ],
     )
 
