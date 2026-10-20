@@ -1,25 +1,45 @@
 name: Keep Streamlit app awake
 
-# Visita la app cada 10 minutos, 24/7, para que Streamlit Community Cloud
-# nunca la detecte inactiva y la "duerma". Así se evita el cold start lento
-# que se ve en el primer ingreso del día.
+# Abre la app cada hora con un navegador real (Playwright + Chromium) para
+# que Streamlit Community Cloud la cuente como visitada y no la "duerma"
+# (se duerme tras ~12 horas sin visitas). Si estaba dormida, aprieta el
+# botón para despertarla. Ver .github/scripts/keepalive.py.
 #
-# Nota: esto hace una petición HTTP simple (curl), no abre un navegador real.
-# Si en la práctica la app sigue durmiéndose (porque Streamlit solo cuenta
-# como "actividad" una conexión de verdad, con el websocket abierto), el
-# siguiente paso sería cambiar este ping por uno con un navegador headless
-# (Playwright) en vez de curl.
+# Ojo: GitHub solo corre los workflows programados (schedule) que están en
+# la rama por defecto del repo (main) — este archivo tiene que estar ahí.
+# También los pausa si el repo pasa 60 días sin commits; en ese caso hay
+# que reactivarlo a mano en la pestaña Actions.
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "17 * * * *"  # minuto 17 de cada hora (en punto GitHub se satura y atrasa)
   workflow_dispatch: {}
 
 jobs:
-  ping:
+  visitar:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
-      - name: Ping la app para mantenerla despierta
+      - uses: actions/checkout@v4
+        with:
+          sparse-checkout: .github/scripts
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Instalar Playwright
         run: |
-          curl -s -o /dev/null -w "HTTP %{http_code}\n" --max-time 30 --retry 2 \
-            "https://panaderia-sistema-uumamth9pioq35cftmxjuc.streamlit.app/"
+          pip install playwright
+          python -m playwright install --with-deps chromium
+
+      - name: Abrir la app (y despertarla si está dormida)
+        run: python .github/scripts/keepalive.py
+
+      - name: Guardar captura si la app no cargó
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: keepalive-error
+          path: keepalive-error.png
+          if-no-files-found: ignore
