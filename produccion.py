@@ -14,9 +14,10 @@ no bloquea nada — la decisión de sobrevender o no queda en manos del
 usuario (ver pedidos.py y app.py).
 """
 
-from db import conectar
+from db import conectar, cache_lectura
 
 
+@cache_lectura
 def obtener_configuracion() -> dict:
     """Retorna la configuración actual de capacidad diaria."""
     conn = conectar()
@@ -43,6 +44,7 @@ def actualizar_configuracion(horas_disponibles_dia: float) -> None:
         conn.close()
 
 
+@cache_lectura
 def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) -> float:
     """Minutos de preparación ya comprometidos por pedidos no cancelados
     con fecha_entrega = fecha. `excluir_pedido_id` permite recalcular al
@@ -87,6 +89,7 @@ def capacidad_dia(fecha: str) -> dict:
     }
 
 
+@cache_lectura
 def verificar_disponibilidad(fecha: str, receta_id: int, cantidad: float,
                               excluir_pedido_id: int | None = None) -> dict:
     """Indica si agregar `cantidad` unidades de una receta a una fecha

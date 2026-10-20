@@ -10,7 +10,7 @@ haciendo join contra `pedidos` y `pedido_items`.
 """
 
 from datetime import datetime
-from db import conectar
+from db import conectar, cache_lectura
 
 
 def crear_cliente(nombre: str, telefono: str | None = None,
@@ -55,6 +55,7 @@ def actualizar_cliente(cliente_id: int, nombre: str, telefono: str | None = None
         conn.close()
 
 
+@cache_lectura
 def listar_clientes() -> list[dict]:
     conn = conectar()
     try:
@@ -71,6 +72,7 @@ def _obtener_cliente(conn, cliente_id: int) -> dict:
     return dict(fila)
 
 
+@cache_lectura
 def historial_cliente(cliente_id: int) -> dict:
     """Ficha completa de un cliente: sus datos, su historial de pedidos
     y métricas simples (cantidad de pedidos, total gastado, receta
@@ -121,6 +123,7 @@ def historial_cliente(cliente_id: int) -> dict:
     return cliente
 
 
+@cache_lectura
 def reporte_top_clientes(limite: int = 10) -> list[dict]:
     """Ranking de clientes por total gastado (solo pedidos pagados y no
     cancelados). Responde "quién compra más"."""

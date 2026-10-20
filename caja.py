@@ -13,7 +13,7 @@ este mes?".
 """
 
 from datetime import date
-from db import conectar
+from db import conectar, cache_lectura
 
 TIPOS_VALIDOS = ("ingreso", "gasto")
 MEDIOS_VALIDOS = ("transferencia", "debito", "credito", "efectivo")
@@ -77,6 +77,7 @@ def eliminar_movimiento(movimiento_id: int) -> None:
         conn.close()
 
 
+@cache_lectura
 def listar_movimientos(desde: str | None = None, hasta: str | None = None,
                         tipo: str | None = None, medio_pago: str | None = None) -> list[dict]:
     """Lista movimientos de caja, más recientes primero.
@@ -168,6 +169,7 @@ def saldo_actual() -> float:
 
 # --- Comisiones de medios de pago (ej. Mercado Pago Point) -----------------
 
+@cache_lectura
 def obtener_configuracion_comisiones() -> dict:
     """Retorna las tasas de comisión configuradas para débito y crédito
     (como fracción, ej. 0.0219 = 2,19%) y el IVA que se les aplica encima."""

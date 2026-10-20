@@ -20,7 +20,6 @@ Definiciones clave:
 from calendar import monthrange
 from datetime import date
 
-from db import conectar
 import pedidos as mod_pedidos
 import recetas as mod_rec
 import caja as mod_caja
@@ -43,20 +42,13 @@ def mes_anterior(anio: int, mes: int) -> tuple[int, int]:
 
 
 def _pedidos_creados_entre(desde: str, hasta: str) -> list[dict]:
-    """Pedidos cuya fecha_creacion (no fecha_entrega) cae en el rango."""
-    conn = conectar()
-    try:
-        ids = [
-            f["id"] for f in conn.execute(
-                """SELECT id FROM pedidos
-                   WHERE fecha_creacion::date >= %s AND fecha_creacion::date <= %s
-                   ORDER BY fecha_creacion ASC""",
-                (desde, hasta),
-            ).fetchall()
-        ]
-    finally:
-        conn.close()
-    return [mod_pedidos.detalle_pedido(pid) for pid in ids]
+    """Pedidos cuya fecha_creacion (no fecha_entrega) cae en el rango.
+
+    Antes esto llamaba a `detalle_pedido` por cada pedido (2 consultas a
+    Supabase por pedido, y el dashboard lo pedía 4 veces por pantalla):
+    con 50 pedidos en el mes eran ~400 viajes de red en cada click. Ahora
+    son 2 consultas, y además quedan cacheadas."""
+    return mod_pedidos.listar_pedidos_creados_entre(desde, hasta)
 
 
 def resumen_pedidos_mes(anio: int, mes: int) -> dict:

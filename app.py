@@ -258,15 +258,22 @@ def seccion_recetas():
             ]
             df["margen_real"] = (df["margen_real"] * 100).round(1)
             df["margen_objetivo"] = (df["margen_objetivo"] * 100).round(1)
+            df["bajo_margen"] = df["bajo_margen"].map({True: "⚠ Bajo margen", False: "OK"})
 
             def resaltar_bajo_margen(fila):
-                color = "background-color: #ffe3e3" if fila["bajo_margen"] else ""
-                return [color] * len(fila)
+                # Rojo semitransparente (no un rosado claro fijo): se mezcla con
+                # el fondo del tema, así el texto (que sigue el color del tema)
+                # contrasta igual en modo claro y oscuro. El texto "⚠ Bajo margen"
+                # deja la alerta legible aunque no se distinga el color.
+                if fila["bajo_margen"] == "OK":
+                    return [""] * len(fila)
+                return ["background-color: rgba(255, 75, 75, 0.28)"] * len(fila)
 
             st.dataframe(
                 df.style.apply(resaltar_bajo_margen, axis=1),
                 width='stretch',
                 hide_index=True,
+                column_config={"bajo_margen": st.column_config.TextColumn("Estado")},
             )
 
     elif vista == "Crear receta":

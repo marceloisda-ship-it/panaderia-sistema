@@ -19,7 +19,7 @@ registrarlo dos veces.
 """
 
 from datetime import date, datetime, timedelta
-from db import conectar
+from db import conectar, cache_lectura
 import caja as mod_caja
 
 ESTADOS_VALIDOS = ("pendiente", "confirmado", "entregado", "cancelado")
@@ -100,8 +100,16 @@ def _obtener_pedido(conn, pedido_id: int) -> dict:
     return dict(fila)
 
 
+@cache_lectura
 def detalle_pedido(pedido_id: int) -> dict:
     """Retorna el pedido con sus ítems y el total calculado."""
+    return _detalle_pedido_sin_cache(pedido_id)
+
+
+def _detalle_pedido_sin_cache(pedido_id: int) -> dict:
+    """Igual que `detalle_pedido`, pero leyendo siempre de la base. Para
+    validaciones antes de escribir (ej. no cobrar dos veces un pedido),
+    donde no conviene arriesgar un dato cacheado."""
     conn = conectar()
     try:
         pedido = _obtener_pedido(conn, pedido_id)
@@ -212,6 +220,7 @@ def generar_mensaje_datos_transferencia_whatsapp(nombre: str, rut: str, tipo_cue
     ])
 
 
+@cache_lectura
 def listar_pedidos(desde: str | None = None, hasta: str | None = None,
                     estado: str | None = None) -> list[dict]:
     """Lista pedidos (con su total ya calculado), por fecha de entrega
@@ -233,13 +242,28 @@ def listar_pedidos(desde: str | None = None, hasta: str | None = None,
     if estado:
         condiciones.append("p.estado = %s")
         parametros.append(estado)
+    return _listar_pedidos_con_items(condiciones, parametros, "p.fecha_entrega ASC, p.id ASC")
 
+
+@cache_lectura
+def listar_pedidos_creados_entre(desde: str, hasta: str) -> list[dict]:
+    """Como `listar_pedidos`, pero filtrando por fecha_creacion (cuándo se
+    tomó el pedido) en vez de fecha_entrega — es la que usa el dashboard.
+    Trae todo en 2 consultas, en vez de 2 consultas por cada pedido."""
+    return _listar_pedidos_con_items(
+        ["p.fecha_creacion::date >= %s", "p.fecha_creacion::date <= %s"],
+        [desde, hasta],
+        "p.fecha_creacion ASC",
+    )
+
+
+def _listar_pedidos_con_items(condiciones: list[str], parametros: list, orden: str) -> list[dict]:
     query = """SELECT p.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
                FROM pedidos p
                JOIN clientes c ON c.id = p.cliente_id"""
     if condiciones:
         query += " WHERE " + " AND ".join(condiciones)
-    query += " ORDER BY p.fecha_entrega ASC, p.id ASC"
+    query += " ORDER BY " + orden
 
     conn = conectar()
     try:
@@ -276,6 +300,7 @@ def listar_pedidos(desde: str | None = None, hasta: str | None = None,
     return pedidos
 
 
+@cache_lectura
 def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
     """Retorna id, cliente, fecha de entrega y estado de cada pedido, sin
     traer ítems ni calcular el total.
@@ -417,7 +442,7 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
     if medio_pago not in mod_caja.MEDIOS_VALIDOS:
         raise ValueError(f"medio_pago debe ser uno de {mod_caja.MEDIOS_VALIDOS}")
 
-    detalle = detalle_pedido(pedido_id)
+    detalle = _detalle_pedido_sin_cache(pedido_id)
     if detalle["estado"] == "entregado" and detalle["pagado"]:
         raise ValueError("Este pedido ya fue marcado como entregado y pagado")
     if detalle["estado"] == "cancelado":
@@ -467,6 +492,7 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
     }
 
 
+@cache_lectura
 def reporte_productos_populares(limite: int = 10) -> list[dict]:
     """Ranking de recetas por unidades pedidas (pedidos no cancelados).
     Responde "qué pan se pide más"."""

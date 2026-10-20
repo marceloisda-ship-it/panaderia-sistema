@@ -29,7 +29,7 @@ un pan dejó de ser rentable por la subida de algún insumo o de los
 costos indirectos.
 """
 
-from db import conectar
+from db import conectar, cache_lectura
 import costos_indirectos
 
 
@@ -206,6 +206,7 @@ def _calcular_costo(receta: dict, filas_ingredientes: list, config: dict) -> dic
     }
 
 
+@cache_lectura
 def detalle_receta(receta_id: int) -> dict:
     """Retorna el detalle completo de una receta: datos generales,
     lista de ingredientes, desglose de costo directo e indirecto,
@@ -229,6 +230,7 @@ def detalle_receta(receta_id: int) -> dict:
     return _calcular_costo(receta, filas, config)
 
 
+@cache_lectura
 def listar_recetas(solo_activas: bool = True) -> list[dict]:
     """Retorna todas las recetas con su costo y margen ya calculados.
     Útil para el reporte general de rentabilidad.
@@ -265,6 +267,7 @@ def listar_recetas(solo_activas: bool = True) -> list[dict]:
     return [_calcular_costo(r, ingredientes_por_receta[r["id"]], config) for r in recetas]
 
 
+@cache_lectura
 def listar_recetas_resumen(solo_activas: bool = False) -> list[dict]:
     """Retorna solo id y nombre de cada receta, sin calcular costo/margen.
 

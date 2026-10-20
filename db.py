@@ -54,6 +54,12 @@ class _ConexionConExecute:
 
     def commit(self):
         self._conn.commit()
+        # Toda escritura del sistema pasa por acá: al confirmarla se
+        # invalida el caché de lecturas (ver `cache_lectura`), así la
+        # próxima pantalla ya ve el dato nuevo. st.cache_data es global al
+        # proceso, así que esto también refresca a los demás usuarios
+        # conectados al mismo tiempo.
+        st.cache_data.clear()
 
     def rollback(self):
         self._conn.rollback()
@@ -90,6 +96,21 @@ def conectar() -> _ConexionConExecute:
     clave = uuid.uuid4().hex
     conn = _pool().getconn(key=clave)
     return _ConexionConExecute(conn, _pool(), clave)
+
+
+def cache_lectura(func):
+    """Decorador para las funciones de solo lectura de los módulos de
+    negocio. Streamlit re-ejecuta todo el script en cada click (cambiar
+    de pestaña, mover un slider, elegir una opción en un selectbox), y sin
+    caché cada rerun volvía a mandar todas las consultas de la pantalla a
+    Supabase — cada una es un viaje de red real, y desde el celular o la
+    tablet eso se nota todavía más.
+
+    El caché se vacía solo en cada `commit()` (ver `_ConexionConExecute`),
+    así que después de guardar algo nunca se muestra un dato viejo. El
+    `ttl` es solo un respaldo por si alguien edita la base por fuera de la
+    app (panel de Supabase, migrar_datos.py)."""
+    return st.cache_data(ttl=600, show_spinner=False)(func)
 
 
 def inicializar_db() -> None:

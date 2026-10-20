@@ -40,7 +40,7 @@ from datetime import datetime
 import requests
 import streamlit as st
 
-from db import conectar
+from db import conectar, cache_lectura
 import pedidos as mod_pedidos
 
 TIPOS_MENSAJE = ("pedido_creado", "pedido_confirmado", "recordatorio_pago", "pedido_pagado")
@@ -254,6 +254,7 @@ def enviar_pedido_pagado(pedido_id: int, medio_pago: str) -> dict:
     )
 
 
+@cache_lectura
 def historial_mensajes(pedido_id: int) -> list[dict]:
     """Mensajes de WhatsApp enviados (o intentados) para un pedido,
     más reciente primero. Para mostrar en el detalle del pedido y

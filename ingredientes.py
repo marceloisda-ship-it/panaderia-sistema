@@ -8,7 +8,7 @@ de costo de una receta sea una simple multiplicación.
 """
 
 from datetime import datetime
-from db import conectar
+from db import conectar, cache_lectura
 
 UNIDADES_VALIDAS = ("gr", "ml", "unidad")
 
@@ -77,6 +77,7 @@ def actualizar_precio(ingrediente_id: int, nuevo_precio: float) -> None:
         conn.close()
 
 
+@cache_lectura
 def listar_ingredientes() -> list[dict]:
     """Retorna todos los ingredientes registrados, ordenados por nombre."""
     conn = conectar()
@@ -89,6 +90,7 @@ def listar_ingredientes() -> list[dict]:
         conn.close()
 
 
+@cache_lectura
 def buscar_ingrediente_por_nombre(nombre: str) -> dict | None:
     """Busca un ingrediente por nombre exacto. Retorna None si no existe."""
     conn = conectar()
@@ -101,6 +103,7 @@ def buscar_ingrediente_por_nombre(nombre: str) -> dict | None:
         conn.close()
 
 
+@cache_lectura
 def historial_de_precio(ingrediente_id: int) -> list[dict]:
     """Retorna el historial de precios de un ingrediente, del más antiguo al más reciente."""
     conn = conectar()
@@ -149,6 +152,7 @@ def actualizar_proveedor(ingrediente_id: int, nuevo_proveedor: str | None) -> No
         conn.close()
 
 
+@cache_lectura
 def recetas_que_usan_ingrediente(ingrediente_id: int) -> list[dict]:
     """Retorna las recetas (id, nombre) que usan este ingrediente. Sirve
     para explicar por qué no se puede eliminar, o qué hay que revisar antes."""
