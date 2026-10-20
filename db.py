@@ -120,11 +120,14 @@ def inicializar_db() -> None:
     no borra ni duplica datos existentes.
     """
     conn = conectar()
-    cursor = conn.cursor()
+    # Todas las sentencias se mandan juntas en un solo execute(): contra
+    # Supabase cada execute es un viaje de red, y este arranque corre al
+    # despertar la app (cuando también hay que llenar el caché).
+    sentencias = []
 
     # --- Módulo de Costeo -------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS ingredientes (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL UNIQUE,
@@ -135,7 +138,7 @@ def inicializar_db() -> None:
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS historial_precios_ingredientes (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             ingrediente_id INTEGER NOT NULL REFERENCES ingredientes(id) ON DELETE CASCADE,
@@ -144,7 +147,7 @@ def inicializar_db() -> None:
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS recetas (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL UNIQUE,
@@ -158,7 +161,7 @@ def inicializar_db() -> None:
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS receta_ingredientes (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             receta_id INTEGER NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
@@ -170,7 +173,7 @@ def inicializar_db() -> None:
 
     # --- Módulo de Flujo de caja -------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS movimientos_caja (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             tipo TEXT NOT NULL CHECK (tipo IN ('ingreso', 'gasto')),
@@ -189,7 +192,7 @@ def inicializar_db() -> None:
     # cuando se cobra un pedido con débito o crédito (ver pedidos.py).
     # Los porcentajes se guardan como fracción (ej. 0.0219 = 2,19%).
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_comisiones (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             tasa_debito_pct REAL NOT NULL DEFAULT 0 CHECK (tasa_debito_pct >= 0),
@@ -197,7 +200,7 @@ def inicializar_db() -> None:
             iva_pct REAL NOT NULL DEFAULT 0 CHECK (iva_pct >= 0)
         );
     """)
-    cursor.execute("""
+    sentencias.append("""
         INSERT INTO configuracion_comisiones (id, tasa_debito_pct, tasa_credito_pct, iva_pct)
         VALUES (1, 0.0219, 0.0269, 0.19)
         ON CONFLICT (id) DO NOTHING;
@@ -207,7 +210,7 @@ def inicializar_db() -> None:
     # Fila única (id = 1) con los parámetros globales para prorratear
     # costos indirectos al costeo de cada receta.
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_costos (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             costo_empaque_unidad REAL NOT NULL DEFAULT 0 CHECK (costo_empaque_unidad >= 0),
@@ -216,7 +219,7 @@ def inicializar_db() -> None:
             factor_descuento_luz REAL NOT NULL DEFAULT 1 CHECK (factor_descuento_luz >= 0 AND factor_descuento_luz <= 1)
         );
     """)
-    cursor.execute("""
+    sentencias.append("""
         INSERT INTO configuracion_costos
             (id, costo_empaque_unidad, valor_hora_mano_obra, tarifa_electrica_kwh, factor_descuento_luz)
         VALUES (1, 0, 0, 0, 1)
@@ -228,13 +231,13 @@ def inicializar_db() -> None:
     # usada junto con tiempo_preparacion_min/unidades_por_lote de cada
     # receta para calcular cuánto se puede comprometer por día (Pedidos).
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_produccion (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             horas_disponibles_dia REAL NOT NULL DEFAULT 0 CHECK (horas_disponibles_dia >= 0)
         );
     """)
-    cursor.execute("""
+    sentencias.append("""
         INSERT INTO configuracion_produccion (id, horas_disponibles_dia)
         VALUES (1, 0)
         ON CONFLICT (id) DO NOTHING;
@@ -242,7 +245,7 @@ def inicializar_db() -> None:
 
     # --- Módulo de Clientes --------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS clientes (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL,
@@ -255,7 +258,7 @@ def inicializar_db() -> None:
 
     # --- Módulo de Pedidos ---------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS pedidos (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE RESTRICT,
@@ -269,7 +272,7 @@ def inicializar_db() -> None:
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS pedido_items (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             pedido_id INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
@@ -286,7 +289,7 @@ def inicializar_db() -> None:
     # bien o mal. Sirve para auditar envíos y para no perder el rastro de un
     # envío fallido (número inválido, plantilla no aprobada, etc.).
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS mensajes_whatsapp (
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             pedido_id INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
@@ -299,5 +302,6 @@ def inicializar_db() -> None:
         );
     """)
 
+    conn.execute("\n".join(sentencias))
     conn.commit()
     conn.close()

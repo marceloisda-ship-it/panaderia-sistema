@@ -1233,10 +1233,9 @@ def seccion_dashboard():
 
     anio_ant, mes_ant = mod_dash.mes_anterior(anio, mes)
 
-    ped = mod_dash.resumen_pedidos_mes(anio, mes)
-    ped_ant = mod_dash.resumen_pedidos_mes(anio_ant, mes_ant)
-    fin = mod_dash.resumen_financiero_mes(anio, mes)
-    fin_ant = mod_dash.resumen_financiero_mes(anio_ant, mes_ant)
+    datos = mod_dash.datos_dashboard(int(anio), int(mes))
+    ped, ped_ant = datos["pedidos"], datos["pedidos_anterior"]
+    fin, fin_ant = datos["financiero"], datos["financiero_anterior"]
 
     st.caption(
         f"{NOMBRES_MESES[mes - 1]} {anio} · comparado contra "
@@ -1273,7 +1272,7 @@ def seccion_dashboard():
         ).set_index("estado")
         st.bar_chart(df_estado["cantidad"])
 
-    bajo_margen = mod_dash.recetas_bajo_margen()
+    bajo_margen = datos["recetas_bajo_margen"]
     if bajo_margen:
         nombres = ", ".join(r["nombre"] for r in bajo_margen)
         st.warning(f"⚠ {len(bajo_margen)} receta(s) por debajo de su margen objetivo: {nombres}")
@@ -1287,14 +1286,14 @@ def seccion_dashboard():
     col_izq, col_der = st.columns(2)
     with col_izq:
         st.markdown("**Más vendidos (unidades)**")
-        ranking_ventas = mod_dash.ranking_productos_mes(anio, mes)
+        ranking_ventas = datos["ranking_ventas"]
         if not ranking_ventas:
             st.info("Sin ventas este mes.")
         else:
             st.dataframe(pd.DataFrame(ranking_ventas), width='stretch', hide_index=True)
     with col_der:
         st.markdown("**Más rentables (ganancia estimada)**")
-        ranking_rentabilidad = mod_dash.rentabilidad_productos_mes(anio, mes)
+        ranking_rentabilidad = datos["ranking_rentabilidad"]
         if not ranking_rentabilidad:
             st.info("Sin ventas este mes.")
         else:

@@ -118,8 +118,14 @@ def resumen_periodo(desde: str | None = None, hasta: str | None = None) -> dict:
     """Retorna un resumen de ingresos y gastos en un período (o de toda la
     historia, si no se indican fechas), desglosado por medio de pago.
     """
-    movimientos = listar_movimientos(desde=desde, hasta=hasta)
+    return resumir_movimientos(listar_movimientos(desde=desde, hasta=hasta), desde, hasta)
 
+
+def resumir_movimientos(movimientos: list[dict], desde: str | None = None,
+                        hasta: str | None = None) -> dict:
+    """Cálculo puro (sin acceso a datos) de `resumen_periodo` a partir de
+    movimientos ya traídos — lo reusa el dashboard, que trae todo en una
+    sola consulta."""
     total_ingresos = 0.0
     total_gastos = 0.0
     por_medio_pago = {m: {"ingresos": 0.0, "gastos": 0.0} for m in MEDIOS_VALIDOS}

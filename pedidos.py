@@ -245,18 +245,6 @@ def listar_pedidos(desde: str | None = None, hasta: str | None = None,
     return _listar_pedidos_con_items(condiciones, parametros, "p.fecha_entrega ASC, p.id ASC")
 
 
-@cache_lectura
-def listar_pedidos_creados_entre(desde: str, hasta: str) -> list[dict]:
-    """Como `listar_pedidos`, pero filtrando por fecha_creacion (cuándo se
-    tomó el pedido) en vez de fecha_entrega — es la que usa el dashboard.
-    Trae todo en 2 consultas, en vez de 2 consultas por cada pedido."""
-    return _listar_pedidos_con_items(
-        ["p.fecha_creacion::date >= %s", "p.fecha_creacion::date <= %s"],
-        [desde, hasta],
-        "p.fecha_creacion ASC",
-    )
-
-
 def _listar_pedidos_con_items(condiciones: list[str], parametros: list, orden: str) -> list[dict]:
     query = """SELECT p.*, c.nombre AS cliente_nombre, c.telefono AS cliente_telefono
                FROM pedidos p
