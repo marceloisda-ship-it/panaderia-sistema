@@ -77,6 +77,37 @@ def eliminar_movimiento(movimiento_id: int) -> None:
         conn.close()
 
 
+def actualizar_movimiento(movimiento_id: int, tipo: str, monto: float, medio_pago: str,
+                          categoria: str | None = None, descripcion: str | None = None,
+                          fecha: str | None = None) -> None:
+    """Corrige un movimiento de caja ya registrado (ej. un monto mal
+    tipeado). Valida igual que `registrar_movimiento`."""
+    if tipo not in TIPOS_VALIDOS:
+        raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
+    if medio_pago not in MEDIOS_VALIDOS:
+        raise ValueError(f"medio_pago debe ser uno de {MEDIOS_VALIDOS}")
+    if monto <= 0:
+        raise ValueError("El monto debe ser mayor a 0")
+
+    fecha = fecha or date.today().isoformat()
+
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """UPDATE movimientos_caja
+               SET tipo = %s, monto = %s, medio_pago = %s, categoria = %s, descripcion = %s, fecha = %s
+               WHERE id = %s
+               RETURNING id""",
+            (tipo, monto, medio_pago, categoria, descripcion, fecha, movimiento_id),
+        )
+        if cursor.fetchone() is None:
+            raise ValueError(f"No existe un movimiento con id {movimiento_id}")
+        conn.commit()
+    finally:
+        conn.close()
+
+
 @cache_lectura
 def listar_movimientos(desde: str | None = None, hasta: str | None = None,
                         tipo: str | None = None, medio_pago: str | None = None) -> list[dict]:

@@ -509,12 +509,52 @@ def seccion_caja():
             st.info("No hay movimientos en ese rango.")
         else:
             st.dataframe(pd.DataFrame(movimientos), width='stretch', hide_index=True)
-            ids = [m["id"] for m in movimientos]
-            col_a, col_b = st.columns([3, 1])
-            mov_a_eliminar = col_a.selectbox("Id a eliminar", ids, key="mov_eliminar")
-            if col_b.button("Eliminar", type="secondary"):
+
+            st.subheader("Corregir o eliminar un movimiento")
+            opciones_mov = {
+                f"#{m['id']} · {m['fecha']} · {m['tipo']} · ${m['monto']:,.0f} · {m['categoria'] or 'sin categoría'}": m
+                for m in movimientos
+            }
+            mov = opciones_mov[st.selectbox("Movimiento", list(opciones_mov.keys()), key="mov_editar")]
+
+            if mov["categoria"] in ("Pedido", "Comisión Mercado Pago"):
+                st.warning(
+                    "Este movimiento lo generó automáticamente el cobro de un pedido. Si lo "
+                    "corriges aquí, el total del pedido en Pedidos no cambia."
+                )
+
+            # La key incluye el id para que, al elegir otro movimiento, el
+            # formulario se vuelva a llenar con los datos de ese movimiento.
+            with st.form(f"form_editar_mov_{mov['id']}"):
+                col_t, col_m = st.columns(2)
+                tipo = col_t.selectbox(
+                    "Tipo", mod_caja.TIPOS_VALIDOS, index=mod_caja.TIPOS_VALIDOS.index(mov["tipo"])
+                )
+                monto = col_m.number_input("Monto", min_value=0.0, step=100.0, value=float(mov["monto"]))
+                col_p, col_f = st.columns(2)
+                medio = col_p.selectbox(
+                    "Medio de pago", mod_caja.MEDIOS_VALIDOS,
+                    index=mod_caja.MEDIOS_VALIDOS.index(mov["medio_pago"]),
+                )
+                fecha = col_f.date_input("Fecha", value=date.fromisoformat(mov["fecha"]))
+                categoria = st.text_input("Categoría (opcional)", value=mov["categoria"] or "")
+                descripcion = st.text_input("Descripción (opcional)", value=mov["descripcion"] or "")
+                guardar = st.form_submit_button("Guardar corrección")
+            if guardar:
                 try:
-                    mod_caja.eliminar_movimiento(mov_a_eliminar)
+                    mod_caja.actualizar_movimiento(
+                        mov["id"], tipo, monto, medio, categoria or None, descripcion or None,
+                        fecha.isoformat(),
+                    )
+                    st.success(f"Movimiento #{mov['id']} corregido.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
+
+            confirmar = st.checkbox(f"Confirmo que quiero eliminar el movimiento #{mov['id']}", key="mov_conf_eliminar")
+            if st.button("Eliminar movimiento", type="secondary", disabled=not confirmar):
+                try:
+                    mod_caja.eliminar_movimiento(mov["id"])
                     st.success("Movimiento eliminado.")
                     st.rerun()
                 except Exception as e:
