@@ -36,6 +36,7 @@ chilenos y los deja en formato E.164 (+569XXXXXXXX) antes de enviar.
 
 import re
 from datetime import datetime
+from urllib.parse import quote
 
 import requests
 import streamlit as st
@@ -103,6 +104,28 @@ _MEDIOS_PAGO_LEGIBLES = {
 
 def _fecha_legible(fecha_iso: str) -> str:
     return datetime.strptime(fecha_iso, "%Y-%m-%d").strftime("%d-%m-%Y")
+
+
+def enlace_chat(telefono: str | None, texto: str) -> str | None:
+    """Enlace wa.me que abre el chat del cliente con `texto` ya escrito,
+    para mandarlo a mano desde el WhatsApp del negocio (no usa la Cloud
+    API: funciona sin credenciales ni plantillas aprobadas). Retorna None
+    si el teléfono falta o no es un celular chileno válido."""
+    try:
+        telefono_e164 = normalizar_telefono(telefono)
+    except ValueError:
+        return None
+    return f"https://wa.me/{telefono_e164.lstrip('+')}?text={quote(texto)}"
+
+
+def api_configurada() -> bool:
+    """True si están cargadas las credenciales de la Cloud API. Mientras
+    no lo estén, la app no intenta envíos automáticos (fallarían todos)."""
+    try:
+        _credenciales()
+        return True
+    except ErrorEnvioWhatsapp:
+        return False
 
 
 def _credenciales() -> tuple[str, str, str]:

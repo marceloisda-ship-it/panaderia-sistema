@@ -198,6 +198,21 @@ def generar_mensaje_cobro_whatsapp(pedido_id: int) -> str:
     return "\n".join(lineas)
 
 
+def generar_recordatorio_pago_whatsapp(pedido_id: int) -> str:
+    """Genera un recordatorio amable de pago pendiente, listo para copiar
+    y pegar (o abrir directo) en WhatsApp."""
+    pedido = detalle_pedido(pedido_id)
+
+    lineas = _encabezado_whatsapp(pedido, pedido_id, "Te escribimos para recordarte el pago de tu pedido:")
+    for item in pedido["items"]:
+        lineas.append(f"- {item['cantidad']} x {item['nombre']} — {_formato_pesos(item['subtotal'])}")
+    lineas.append("")
+    lineas.append(f"💰 *Total pendiente: {_formato_pesos(pedido['total'])}*")
+    lineas.append("")
+    lineas.append("Si ya lo pagaste, ignora este mensaje. ¡Muchas gracias! 😊")
+    return "\n".join(lineas)
+
+
 def generar_mensaje_datos_transferencia_whatsapp(nombre: str, rut: str, tipo_cuenta: str,
                                                   numero_cuenta: str, email: str) -> str:
     """Genera el mensaje con los datos bancarios para transferencia, listo

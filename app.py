@@ -62,6 +62,18 @@ def mostrar_aviso_whatsapp(e: Exception):
     st.warning(f"El pedido se guardó bien, pero no se pudo avisar por WhatsApp: {e}")
 
 
+def mensaje_whatsapp(texto: str, telefono: str | None, etiqueta: str = "💬 Abrir en WhatsApp"):
+    """Muestra un mensaje listo para copiar y, si el cliente tiene un
+    celular válido, un botón que abre su chat de WhatsApp con el texto ya
+    escrito (enlace wa.me: se manda a mano desde el WhatsApp del negocio)."""
+    st.code(texto, language=None)
+    enlace = mod_whatsapp.enlace_chat(telefono, texto)
+    if enlace:
+        st.link_button(etiqueta, enlace)
+    else:
+        st.caption("Para abrirlo directo en WhatsApp, registra un celular válido del cliente en Clientes.")
+
+
 def selector_ingrediente(label: str, key: str):
     """Devuelve (id, dict) del ingrediente elegido en un selectbox, o (None, None)."""
     ings = mod_ing.listar_ingredientes()
@@ -987,10 +999,12 @@ def seccion_pedidos():
             if pedido["items"]:
                 st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
 
+                api_wsp = mod_whatsapp.api_configurada()
+
                 st.subheader("Resumen para WhatsApp")
-                st.caption("Cópialo y pégalo en el chat del cliente, o mándaselo directo desde aquí.")
-                st.code(mod_pedidos.generar_resumen_whatsapp(pedido_id), language=None)
-                if st.button("📲 Enviar pedido por WhatsApp", key="btn_enviar_pedido_creado"):
+                st.caption("Ábrelo en el chat del cliente con el botón, o cópialo y pégalo.")
+                mensaje_whatsapp(mod_pedidos.generar_resumen_whatsapp(pedido_id), pedido["cliente_telefono"])
+                if api_wsp and st.button("📲 Enviar automático (WhatsApp Business API)", key="btn_enviar_pedido_creado"):
                     try:
                         mod_whatsapp.enviar_pedido_creado(pedido_id)
                         st.success("Mensaje enviado por WhatsApp.")
@@ -998,13 +1012,16 @@ def seccion_pedidos():
                         mostrar_error(e)
 
                 if not pedido["pagado"] and pedido["estado"] != "cancelado":
-                    st.caption("¿Este pedido quedó pendiente de pago? Manda un recordatorio cuando quieras:")
-                    if st.button("💸 Enviar recordatorio de pago", key="btn_recordatorio_pago"):
-                        try:
-                            mod_whatsapp.enviar_recordatorio_pago(pedido_id)
-                            st.success("Recordatorio de pago enviado por WhatsApp.")
-                        except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                            mostrar_error(e)
+                    with st.expander("💸 Recordatorio de pago"):
+                        mensaje_whatsapp(
+                            mod_pedidos.generar_recordatorio_pago_whatsapp(pedido_id), pedido["cliente_telefono"]
+                        )
+                        if api_wsp and st.button("📲 Enviar automático (WhatsApp Business API)", key="btn_recordatorio_pago"):
+                            try:
+                                mod_whatsapp.enviar_recordatorio_pago(pedido_id)
+                                st.success("Recordatorio de pago enviado por WhatsApp.")
+                            except mod_whatsapp.ErrorEnvioWhatsapp as e:
+                                mostrar_error(e)
             else:
                 st.info("Este pedido todavía no tiene ítems.")
 
@@ -1041,11 +1058,12 @@ def seccion_pedidos():
                         except Exception as e:
                             mostrar_error(e)
                         else:
-                            try:
-                                mod_whatsapp.enviar_pedido_confirmado(pedido_id)
-                                st.success("Avisado por WhatsApp.")
-                            except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                                mostrar_aviso_whatsapp(e)
+                            if mod_whatsapp.api_configurada():
+                                try:
+                                    mod_whatsapp.enviar_pedido_confirmado(pedido_id)
+                                    st.success("Avisado por WhatsApp.")
+                                except mod_whatsapp.ErrorEnvioWhatsapp as e:
+                                    mostrar_aviso_whatsapp(e)
                             st.rerun()
 
                 st.divider()
@@ -1053,7 +1071,7 @@ def seccion_pedidos():
                 st.caption("Marca el pedido como entregado y genera el ingreso en Flujo de caja automáticamente.")
 
                 st.caption("Mensaje para avisar la entrega y el monto a pagar:")
-                st.code(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), language=None)
+                mensaje_whatsapp(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), pedido["cliente_telefono"])
 
                 with st.expander("Si el cliente va a transferir: datos para copiar"):
                     datos_transferencia = st.secrets.get("datos_transferencia")
@@ -1065,7 +1083,7 @@ def seccion_pedidos():
                             datos_transferencia["numero_cuenta"],
                             datos_transferencia["email"],
                         )
-                        st.code(mensaje_transferencia, language=None)
+                        mensaje_whatsapp(mensaje_transferencia, pedido["cliente_telefono"])
                     else:
                         st.warning(
                             "Configura tus datos de transferencia en .streamlit/secrets.toml "
@@ -1091,11 +1109,12 @@ def seccion_pedidos():
                     except Exception as e:
                         mostrar_error(e)
                     else:
-                        try:
-                            mod_whatsapp.enviar_pedido_pagado(pedido_id, medio)
-                            st.success("Avisado por WhatsApp.")
-                        except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                            mostrar_aviso_whatsapp(e)
+                        if mod_whatsapp.api_configurada():
+                            try:
+                                mod_whatsapp.enviar_pedido_pagado(pedido_id, medio)
+                                st.success("Avisado por WhatsApp.")
+                            except mod_whatsapp.ErrorEnvioWhatsapp as e:
+                                mostrar_aviso_whatsapp(e)
                         st.rerun()
 
                 st.divider()
