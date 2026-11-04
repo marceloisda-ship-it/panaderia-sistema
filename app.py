@@ -1427,7 +1427,11 @@ def seccion_pedidos():
                     st.rerun()
 
     elif vista == "Agregar ítems":
-        pedido_id = selector_pedido("Pedido", "sel_pedido_items")
+        # Solo se agregan ítems antes de empezar a hornear.
+        pedido_id = selector_pedido(
+            "Pedido", "sel_pedido_items",
+            filtro=lambda p: p["estado"] in ("recibido", "confirmado"),
+        )
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
             if pedido["estado"] in ("entregado", "cancelado"):
