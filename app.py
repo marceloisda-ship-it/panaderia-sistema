@@ -123,22 +123,19 @@ def _es_por_cobrar(p: dict) -> bool:
 
 
 # Filtros de pedidos que no son un estado único (Agenda y Detalle).
-_FILTRO_ABIERTOS = "Abiertos (sin entregar)"
 _FILTRO_POR_COBRAR = "Por cobrar (entregados sin pago)"
 _FILTRO_TODOS = "(todos)"
 
 
 def _opciones_filtro_pedidos() -> list[str]:
-    return [_FILTRO_ABIERTOS, _FILTRO_POR_COBRAR, _FILTRO_TODOS] + [
+    return [_FILTRO_TODOS] + [
         mod_pedidos.etiqueta_estado(e) for e in mod_pedidos.ESTADOS_VALIDOS
-    ]
+    ] + [_FILTRO_POR_COBRAR]
 
 
 def _aplicar_filtro_pedidos(opcion: str):
     """Traduce una opción de `_opciones_filtro_pedidos` a (estado, filtro)
     para `listar_pedidos` / `selector_pedido`."""
-    if opcion == _FILTRO_ABIERTOS:
-        return None, lambda p: p["estado"] in mod_pedidos.ESTADOS_ABIERTOS
     if opcion == _FILTRO_POR_COBRAR:
         return "entregado", lambda p: not p["pagado"]
     if opcion == _FILTRO_TODOS:
