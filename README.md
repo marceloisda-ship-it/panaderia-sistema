@@ -148,10 +148,12 @@ fijo relevante. Si eso cambia, se puede ampliar el mismo mecanismo.
    receta (mano de obra, ver Costos indirectos) para saber cuánto de esa
    capacidad ya está comprometida en pedidos de un día dado.
 6. La pestaña **Planificación** te da la vista para organizarte: un
-   gráfico de barras con las unidades pedidas día por día (para ver de
-   un vistazo qué días vienen más cargados), y al elegir un día
-   puntual, el desglose de **qué panes preparar** (agregado entre todos
-   los pedidos de ese día) y el detalle de cada pedido con su cliente.
+   **calendario del mes** con los pedidos de cada día (chips de color por
+   estado: pendiente, confirmado, entregado; borde rojo si el día está
+   sobrevendido), un resumen del mes con **tiempo requerido, disponible
+   y restante** (de hoy en adelante), y al elegir un día puntual, el
+   desglose de **qué panes preparar** (agregado entre todos los pedidos
+   de ese día) y el detalle de cada pedido con su cliente.
 
 ## Cómo funcionan los clientes
 
@@ -207,6 +209,118 @@ fijo relevante. Si eso cambia, se puede ampliar el mismo mecanismo.
 - [x] Interfaz visual local (Streamlit), reusando toda la lógica ya
       construida en estos módulos — ver `app.py`.
 
+## Flujo ideal de un pedido (la visión)
+
+Así debería vivir cada pedido de la panadería, de punta a punta. Es la
+referencia contra la que se mide todo lo que se construye de aquí en
+adelante.
+
+| # | Qué pasa | Estado del pedido |
+|---|----------|-------------------|
+| 1 | **Recibimos el pedido.** Llega por WhatsApp, en persona o por Instagram: alguien pide un pan para cierta fecha. | `recibido` |
+| 2 | **Confirmamos.** Se le envía al cliente un mensaje con el detalle de lo pedido; ese mensaje, tal como está, confirma el pedido. | `confirmado` |
+| 3 | **Horneamos.** Se arman las cubetas con los ingredientes y se ponen a hornear. Hay 3 panificadoras: se pueden hacer 3 panes distintos a la vez, o 3 del mismo tipo, según lo que se haya pedido. | `en producción` |
+| 4 | **Avisamos que está listo.** Mensaje al cliente: su pedido está listo y nos contactaremos para coordinar la entrega. | `listo` |
+| 5 | **Entregamos.** Se marca como entregado. A veces el cliente paga al recibir, a veces queda pendiente. | `entregado` |
+| 6 | **Cobranza (solo si no pagó).** Se le envía el detalle del pedido con los medios de pago. No hay plazo fijo de pago, pero se quiere un **recordatorio automático** pasados ciertos días desde la entrega. | `entregado` + por cobrar |
+
+Principios que salen de este flujo:
+
+- **El pago es un eje aparte del estado.** Un pedido puede estar
+  `entregado` y todavía sin pagar. Entregar y cobrar no siempre ocurren
+  juntos.
+- **Delegar al sistema lo repetitivo.** Los mensajes de los pasos 2, 4 y 6
+  deben salir solos; la meta es que el sistema haga el trabajo repetitivo
+  y la persona solo decida y hornee.
+- **El stock se descuenta al hornear (paso 3)**, que es cuando los
+  ingredientes se gastan de verdad, y se verifica al confirmar (paso 2).
+
+## Pasos a seguir
+
+Hoja de ruta por etapas, en el orden propuesto. Cada etapa deja algo
+usable por sí sola. Se marca con `[x]` a medida que se va completando.
+
+### Etapa 1 — Flujo de estados del pedido
+
+La base de todo lo demás: que el sistema refleje el flujo ideal.
+
+- [ ] Estados nuevos: `recibido`, `confirmado`, `en producción`, `listo`,
+      `entregado`, `cancelado` (hoy solo existen pendiente, confirmado,
+      entregado y cancelado). Revisar si la base tiene restricciones
+      sobre los valores permitidos y migrar los pedidos existentes.
+- [ ] Guardar el **canal de origen** del pedido (WhatsApp, presencial,
+      Instagram).
+- [ ] **Separar entrega de pago.** Hoy `entregar_y_cobrar` hace las dos
+      cosas a la vez; debe poder marcarse *entregado* sin pago, y
+      registrar el pago después (generando igual el ingreso en Caja y la
+      comisión, si aplica).
+- [ ] Mostrar los estados nuevos en el calendario de Planificación.
+
+### Etapa 2 — Cobranza
+
+- [ ] Vista **Por cobrar**: pedidos entregados sin pagar, con los días
+      transcurridos desde la entrega y el monto adeudado.
+- [ ] Configurar **a los cuántos días** se considera que corresponde
+      recordar el pago (sin plazo fijo de pago, solo el aviso).
+- [ ] Reutilizar el mensaje de recordatorio de pago que ya existe
+      (detalle del pedido y medios de pago).
+
+### Etapa 3 — Producción con 3 panificadoras
+
+- [ ] Revisar el modelo de capacidad: hoy se mide en horas por día;
+      con 3 máquinas, cada una con su ciclo, conviene reflejar que se
+      pueden hornear hasta 3 tandas en paralelo.
+- [ ] Vista de producción del día: qué va en cada máquina, y poder pasar
+      los pedidos a `en producción` y luego a `listo`.
+
+### Etapa 4 — Stock
+
+Detalle de lo conversado, para cuando llegue su turno:
+
+- [ ] Cantidad actual y **mínimo** por ingrediente, con tres estados:
+      hay / queda poco / sin stock.
+- [ ] Stock por **movimientos** (compra, uso, ajuste por merma o
+      conteo), no editando el número a mano.
+- [ ] Vista **Por reponer**: lo que está bajo el mínimo, agrupado por
+      proveedor, con costo estimado según el último precio.
+- [ ] Descontar automáticamente al pasar un pedido a `en producción`,
+      según la receta.
+- [ ] Avisar al confirmar un pedido si faltan ingredientes.
+- [ ] Más adelante: anticipar faltantes según los pedidos confirmados
+      de la semana.
+- Por definir: si se incluyen insumos (bolsas, etiquetas, cajas) y cómo
+  se ingresan las compras (ej. un saco de 25 kg convertido a gramos).
+
+### Etapa 5 — Mensajes automáticos por WhatsApp
+
+Objetivo: que los mensajes de confirmación, "pedido listo" y cobranza
+salgan solos. Usa la WhatsApp Business Platform (Meta Cloud API); lo
+que hay que resolver antes:
+
+- [ ] Verificación del negocio en Meta y número dedicado.
+- [ ] **Plantillas de mensaje aprobadas** por Meta (los mensajes que el
+      negocio inicia fuera de la ventana de 24 horas requieren plantilla).
+- [ ] Un envío automático ligado a los cambios de estado (confirmado,
+      listo) y un proceso programado diario para los recordatorios de
+      cobranza (ya se usa GitHub Actions para el keepalive; podría
+      servir también aquí).
+- [ ] Si se quiere recibir mensajes (crear pedidos desde el chat), hace
+      falta además un servicio que reciba los avisos de Meta, algo que
+      Streamlit por sí solo no hace.
+
+### Etapa 6 — Google Calendar
+
+- [ ] Exportar los pedidos al calendario del emprendimiento (un evento
+      por pedido, o uno por día con el resumen), actualizándolo al
+      reagendar o cancelar. Solo exportar; sincronizar en ambos
+      sentidos queda descartado por ahora.
+
+### Etapa 7 — Recepción automática de pedidos
+
+- [ ] Registrar pedidos que llegan por WhatsApp o Instagram sin tener
+      que digitarlos a mano. Depende de la Etapa 5 y se evalúa cuando
+      el volumen lo justifique.
+
 ## Ideas para más adelante
 
 - Afinar el factor de descuento de luz (hoy en 65%, provisional) con una
@@ -226,9 +340,9 @@ fijo relevante. Si eso cambia, se puede ampliar el mismo mecanismo.
      en WhatsApp — sin APIs externas, mejora chica dentro del sistema.
   3. Integración real vía WhatsApp Business Platform (Meta Cloud API):
      mensajes y creación de pedidos automáticos. Implica alojar el
-     sistema en un servidor con acceso a internet (hoy corre local) y
-     pasar verificación de negocio de Meta — proyecto aparte, no
-     iniciar sin que el volumen de pedidos lo justifique.
+     sistema en un servidor con acceso a internet (la versión nube ya
+     lo cumple) y pasar verificación de negocio de Meta. Ahora es parte
+     de la hoja de ruta: ver **Pasos a seguir → Etapa 5**.
   4. Automatización avanzada: catálogo interactivo en el chat,
      respuestas automáticas, pagos con link que se registran solos en
      Caja.
