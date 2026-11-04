@@ -9,7 +9,8 @@ Para ejecutar:
     streamlit run app.py
 """
 
-from datetime import date
+import calendar
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
@@ -698,6 +699,176 @@ def seccion_costos_indirectos():
 
 # --- Sección: Pedidos ------------------------------------------------------
 
+_ESTADOS_CALENDARIO = (
+    ("pendiente", "Pendiente", "#e0a100"),
+    ("confirmado", "Confirmado", "#2f7fd8"),
+    ("entregado", "Entregado", "#2e9e5b"),
+)
+_DIAS_SEMANA = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+
+def _calendario_html(anio: int, mes: int, pedidos_por_dia: dict, minutos_por_dia: dict,
+                     disponible_min: float, seleccionado: date | None) -> str:
+    """Grilla mensual en HTML: por día, un chip de color por estado con su
+    cantidad de pedidos. Borde rojo si el día está sobrevendido. Sin
+    indentación ni líneas en blanco para que markdown no lo trate como código."""
+    hoy = date.today()
+    partes = [
+        "<style>"
+        ".cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;}"
+        ".cal-h{text-align:center;font-weight:600;font-size:.8rem;opacity:.7;padding:2px 0;}"
+        ".cal-d{min-height:78px;border:1px solid rgba(128,128,128,.3);border-radius:6px;padding:4px 6px;"
+        "font-size:.8rem;overflow:hidden;}"
+        ".cal-d.vacio{border:none;}"
+        ".cal-d.hoy{border:2px solid #2f7fd8;}"
+        ".cal-d.sel{background:rgba(47,127,216,.12);}"
+        ".cal-d.sobre{border:2px solid #d83a3a;}"
+        ".cal-n{font-weight:600;opacity:.85;}"
+        ".chip{display:block;color:#fff;border-radius:10px;padding:0 6px;margin-top:2px;font-size:.7rem;"
+        "white-space:nowrap;}"
+        "@media(max-width:640px){.cal-d{min-height:56px;padding:2px 3px}.chip{padding:0 3px;font-size:.62rem}}"
+        "</style>",
+        '<div class="cal">',
+    ]
+    partes += [f'<div class="cal-h">{d}</div>' for d in _DIAS_SEMANA]
+
+    for semana in calendar.Calendar(firstweekday=0).monthdatescalendar(anio, mes):
+        for d in semana:
+            if d.month != mes:
+                partes.append('<div class="cal-d vacio"></div>')
+                continue
+            iso = d.isoformat()
+            clases = "cal-d"
+            if d == hoy:
+                clases += " hoy"
+            if d == seleccionado:
+                clases += " sel"
+            if disponible_min > 0 and minutos_por_dia.get(iso, 0) > disponible_min:
+                clases += " sobre"
+            chips = "".join(
+                f'<span class="chip" style="background:{color}">{pedidos_por_dia.get(iso, {}).get(clave)} {nombre.lower()}{"s" if pedidos_por_dia[iso][clave] > 1 else ""}</span>'
+                for clave, nombre, color in _ESTADOS_CALENDARIO
+                if pedidos_por_dia.get(iso, {}).get(clave)
+            )
+            partes.append(f'<div class="{clases}"><span class="cal-n">{d.day}</span>{chips}</div>')
+    partes.append("</div>")
+    return "".join(partes)
+
+
+def _vista_planificacion():
+    hoy = date.today()
+    if "plan_mes_ref" not in st.session_state:
+        st.session_state["plan_mes_ref"] = hoy.replace(day=1)
+    ref: date = st.session_state["plan_mes_ref"]
+
+    col_prev, col_titulo, col_hoy, col_next = st.columns([1, 4, 1.4, 1])
+    nuevo_mes = None
+    if col_prev.button("◀", key="plan_prev", help="Mes anterior", width="stretch"):
+        nuevo_mes = (ref - timedelta(days=1)).replace(day=1)
+    if col_next.button("▶", key="plan_next", help="Mes siguiente", width="stretch"):
+        nuevo_mes = (ref + timedelta(days=32)).replace(day=1)
+    if col_hoy.button("Hoy", key="plan_hoy", width="stretch"):
+        nuevo_mes = hoy.replace(day=1)
+    if nuevo_mes is not None:
+        st.session_state["plan_mes_ref"] = nuevo_mes
+        # Al cambiar de mes, el día seleccionado pasa a hoy (si cae en ese mes) o al día 1.
+        st.session_state["plan_dia_sel"] = hoy if nuevo_mes == hoy.replace(day=1) else nuevo_mes
+        st.rerun()
+    col_titulo.markdown(f"### {NOMBRES_MESES[ref.month - 1]} {ref.year}")
+
+    primer_dia = ref
+    ultimo_dia = ref.replace(day=calendar.monthrange(ref.year, ref.month)[1])
+
+    pedidos_mes = [
+        p for p in mod_pedidos.listar_pedidos(desde=primer_dia.isoformat(), hasta=ultimo_dia.isoformat())
+        if p["estado"] != "cancelado"
+    ]
+    pedidos_por_dia: dict[str, dict[str, int]] = {}
+    for p in pedidos_mes:
+        por_estado = pedidos_por_dia.setdefault(p["fecha_entrega"], {})
+        por_estado[p["estado"]] = por_estado.get(p["estado"], 0) + 1
+
+    minutos_por_dia = mod_prod.tiempo_comprometido_rango(primer_dia.isoformat(), ultimo_dia.isoformat())
+    disponible_dia_min = mod_prod.obtener_configuracion()["horas_disponibles_dia"] * 60
+
+    dia_sel = st.session_state.get("plan_dia_sel", hoy)
+    if not (primer_dia <= dia_sel <= ultimo_dia):
+        dia_sel = hoy if primer_dia <= hoy <= ultimo_dia else primer_dia
+    st.session_state["plan_dia_sel"] = dia_sel
+
+    st.markdown(
+        _calendario_html(ref.year, ref.month, pedidos_por_dia, minutos_por_dia, disponible_dia_min, dia_sel),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "🟡 Pendiente · 🔵 Confirmado · 🟢 Entregado — borde rojo: día sobrevendido "
+        "(más trabajo que horas disponibles). Los pedidos cancelados no se cuentan."
+    )
+
+    # --- Resumen del mes ---------------------------------------------------
+    st.divider()
+    st.subheader(f"Resumen de {NOMBRES_MESES[ref.month - 1].lower()}")
+    conteo = {clave: sum(1 for p in pedidos_mes if p["estado"] == clave) for clave, _, _ in _ESTADOS_CALENDARIO}
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Pedidos del mes", len(pedidos_mes))
+    c2.metric("🟡 Pendientes", conteo["pendiente"])
+    c3.metric("🔵 Confirmados", conteo["confirmado"])
+    c4.metric("🟢 Entregados", conteo["entregado"])
+
+    # Tiempo: solo de hoy en adelante (lo ya pasado no se puede "usar").
+    desde_tiempo = max(primer_dia, hoy)
+    if desde_tiempo > ultimo_dia:
+        st.caption("Este mes ya terminó: no queda tiempo por planificar.")
+    else:
+        dias_restantes = (ultimo_dia - desde_tiempo).days + 1
+        requerido_min = sum(m for f, m in minutos_por_dia.items() if f >= desde_tiempo.isoformat())
+        disponible_min = disponible_dia_min * dias_restantes
+        restante_min = disponible_min - requerido_min
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Tiempo requerido", f"{requerido_min / 60:.1f} h",
+                  help="Horas de preparación de los pedidos de hoy en adelante este mes.")
+        t2.metric("Tiempo disponible", f"{disponible_min / 60:.1f} h",
+                  help=f"{dias_restantes} día(s) × {disponible_dia_min / 60:.1f} h/día (configurable en Capacidad de producción).")
+        t3.metric("Tiempo restante", f"{restante_min / 60:.1f} h",
+                  delta="sobrevendido" if restante_min < 0 else None, delta_color="inverse")
+        if disponible_min > 0:
+            st.progress(min(max(requerido_min / disponible_min, 0.0), 1.0),
+                        text=f"{requerido_min / disponible_min * 100:.0f}% del tiempo del mes comprometido")
+        else:
+            st.info("Configura las horas disponibles por día en 'Capacidad de producción' para ver el tiempo restante.")
+
+    # --- Detalle del día ---------------------------------------------------
+    st.divider()
+    st.subheader("Detalle de un día")
+    dia_sel = st.date_input("Día", min_value=primer_dia, max_value=ultimo_dia, key="plan_dia_sel")
+    resumen = mod_pedidos.resumen_dia(dia_sel.isoformat())
+
+    col1, col2 = st.columns(2)
+    col1.metric("Pedidos ese día", resumen["cantidad_pedidos"])
+    col2.metric("Total a cobrar", f"${resumen['total_a_cobrar']:.2f}")
+
+    cap = mod_prod.capacidad_dia(dia_sel.isoformat())
+    texto_capacidad = f"Capacidad: {cap['comprometido_min']:.0f} / {cap['disponible_min']:.0f} min usados"
+    if cap["sobrevendido"]:
+        st.warning(f"⚠ {texto_capacidad} — este día está sobrevendido.")
+    else:
+        st.caption(texto_capacidad)
+
+    if resumen["items_agregados"]:
+        st.markdown("**Qué preparar ese día**")
+        df_items = pd.DataFrame(resumen["items_agregados"]).set_index("receta")
+        st.dataframe(df_items, width='stretch')
+
+        st.markdown("**Pedidos de ese día**")
+        for p in resumen["pedidos"]:
+            with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"):
+                st.dataframe(pd.DataFrame(p["items"]), width='stretch', hide_index=True)
+                if p["notas"]:
+                    st.caption(f"Notas: {p['notas']}")
+    else:
+        st.info("No hay pedidos para este día.")
+
+
 def seccion_pedidos():
     st.header("📋 Pedidos")
     # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
@@ -712,44 +883,7 @@ def seccion_pedidos():
     )
 
     if vista == "Planificación":
-        st.subheader("Próximos días")
-        dias = st.slider("Ver los próximos... días", min_value=7, max_value=30, value=14, key="dias_planificacion")
-        resumen_dias = mod_pedidos.resumen_proximos_dias(dias)
-        df_dias = pd.DataFrame(resumen_dias).set_index("fecha")
-        st.bar_chart(df_dias["unidades_totales"])
-        st.caption("Unidades totales pedidas por día de entrega (no cuenta pedidos cancelados).")
-        st.dataframe(df_dias, width='stretch')
-
-        st.divider()
-        st.subheader("Detalle de un día")
-        fecha_sel = st.date_input("Fecha de entrega", value=date.today(), key="fecha_planificacion_detalle")
-        resumen = mod_pedidos.resumen_dia(fecha_sel.isoformat())
-
-        col1, col2 = st.columns(2)
-        col1.metric("Pedidos ese día", resumen["cantidad_pedidos"])
-        col2.metric("Total a cobrar", f"${resumen['total_a_cobrar']:.2f}")
-
-        cap = mod_prod.capacidad_dia(fecha_sel.isoformat())
-        texto_capacidad = f"Capacidad: {cap['comprometido_min']:.0f} / {cap['disponible_min']:.0f} min usados"
-        if cap["sobrevendido"]:
-            st.warning(f"⚠ {texto_capacidad} — este día está sobrevendido.")
-        else:
-            st.caption(texto_capacidad)
-
-        if resumen["items_agregados"]:
-            st.subheader("Qué preparar ese día")
-            df_items = pd.DataFrame(resumen["items_agregados"]).set_index("receta")
-            st.bar_chart(df_items["cantidad_total"])
-            st.dataframe(df_items, width='stretch')
-
-            st.subheader("Pedidos de ese día")
-            for p in resumen["pedidos"]:
-                with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"):
-                    st.dataframe(pd.DataFrame(p["items"]), width='stretch', hide_index=True)
-                    if p["notas"]:
-                        st.caption(f"Notas: {p['notas']}")
-        else:
-            st.info("No hay pedidos para este día.")
+        _vista_planificacion()
 
     elif vista == "Agenda":
         col1, col2, col3 = st.columns(3)

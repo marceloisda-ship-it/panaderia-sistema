@@ -74,6 +74,33 @@ def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) ->
     return total_min
 
 
+@cache_lectura
+def tiempo_comprometido_rango(desde: str, hasta: str) -> dict[str, float]:
+    """Minutos de preparación comprometidos por día (pedidos no cancelados)
+    entre `desde` y `hasta` inclusive, en una sola consulta. Retorna
+    {fecha_iso: minutos}; los días sin pedidos no aparecen."""
+    conn = conectar()
+    try:
+        filas = conn.execute(
+            """SELECT p.fecha_entrega, pi.cantidad, r.tiempo_preparacion_min, r.unidades_por_lote
+               FROM pedido_items pi
+               JOIN pedidos p ON p.id = pi.pedido_id
+               JOIN recetas r ON r.id = pi.receta_id
+               WHERE p.fecha_entrega >= %s AND p.fecha_entrega <= %s
+                 AND p.estado != 'cancelado'""",
+            (desde, hasta),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    por_dia: dict[str, float] = {}
+    for f in filas:
+        if f["unidades_por_lote"] > 0:
+            minutos = (f["tiempo_preparacion_min"] / f["unidades_por_lote"]) * f["cantidad"]
+            por_dia[str(f["fecha_entrega"])] = por_dia.get(str(f["fecha_entrega"]), 0.0) + minutos
+    return por_dia
+
+
 def capacidad_dia(fecha: str) -> dict:
     """Retorna el estado de capacidad de un día: minutos disponibles,
     comprometidos y libres, y si ya está sobrevendido."""
