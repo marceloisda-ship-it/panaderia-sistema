@@ -1434,50 +1434,54 @@ def seccion_pedidos():
         )
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
-            if pedido["estado"] in ("entregado", "cancelado"):
-                st.warning(f"Este pedido ya está '{mod_pedidos.etiqueta_estado(pedido['estado'])}', no se puede seguir editando.")
-            else:
-                receta_id = selector_receta("Receta", "sel_receta_para_pedido")
-                if receta_id is not None:
-                    cantidad = st.number_input("Cantidad", min_value=1, step=1, key="cant_item_pedido")
 
-                    disponibilidad = mod_prod.verificar_disponibilidad(
-                        pedido["fecha_entrega"], receta_id, cantidad, excluir_pedido_id=pedido_id
-                    )
-                    if not disponibilidad["cabe"]:
-                        st.warning(
-                            f"⚠ Esto sobrepasa tu capacidad para el {pedido['fecha_entrega']}: "
-                            f"necesita {disponibilidad['tiempo_necesario_min']:.0f} min y solo "
-                            f"quedan {disponibilidad['libre_min']:.0f} min libres ese día. "
-                            "Puedes agregarlo igual si decides sobrevender a propósito."
-                        )
-
-                    if st.button("Agregar/actualizar ítem"):
-                        try:
-                            mod_pedidos.agregar_item_pedido(pedido_id, receta_id, cantidad)
-                            st.success("Ítem agregado/actualizado en el pedido.")
-                            st.rerun()
-                        except Exception as e:
-                            mostrar_error(e)
-
+            # 1. Ítems actuales y su tabla
+            st.subheader("Ítems actuales del pedido")
             if pedido["items"]:
-                st.subheader("Ítems actuales del pedido")
                 st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
                 st.metric("Total del pedido", f"${pedido['total']:.2f}")
+            else:
+                st.caption("Este pedido todavía no tiene ítems.")
 
-                if pedido["estado"] not in ("entregado", "cancelado"):
-                    col_sel, col_btn = st.columns([3, 1])
-                    opciones_quitar = {i["nombre"]: i["receta_id"] for i in pedido["items"]}
-                    nombre_a_quitar = col_sel.selectbox(
-                        "Ítem a quitar", list(opciones_quitar.keys()), key="sel_quitar_item_pedido"
+            # 2. Ítem para agregar y su cantidad
+            receta_id = selector_receta("Ítem para agregar", "sel_receta_para_pedido")
+            if receta_id is not None:
+                cantidad = st.number_input("Cantidad", min_value=1, step=1, key="cant_item_pedido")
+
+                disponibilidad = mod_prod.verificar_disponibilidad(
+                    pedido["fecha_entrega"], receta_id, cantidad, excluir_pedido_id=pedido_id
+                )
+                if not disponibilidad["cabe"]:
+                    st.warning(
+                        f"⚠ Esto sobrepasa tu capacidad para el {pedido['fecha_entrega']}: "
+                        f"necesita {disponibilidad['tiempo_necesario_min']:.0f} min y solo "
+                        f"quedan {disponibilidad['libre_min']:.0f} min libres ese día. "
+                        "Puedes agregarlo igual si decides sobrevender a propósito."
                     )
-                    if col_btn.button("Quitar ítem", type="secondary"):
-                        try:
-                            mod_pedidos.quitar_item_pedido(pedido_id, opciones_quitar[nombre_a_quitar])
-                            st.success(f"'{nombre_a_quitar}' quitado del pedido.")
-                            st.rerun()
-                        except Exception as e:
-                            mostrar_error(e)
+
+                if st.button("Agregar/actualizar ítem"):
+                    try:
+                        mod_pedidos.agregar_item_pedido(pedido_id, receta_id, cantidad)
+                        st.toast("Ítem agregado/actualizado en el pedido.")
+                        st.rerun()
+                    except Exception as e:
+                        mostrar_error(e)
+
+            # 3. Ítem para quitar
+            if pedido["items"]:
+                st.divider()
+                col_sel, col_btn = st.columns([3, 1], vertical_alignment="bottom")
+                opciones_quitar = {i["nombre"]: i["receta_id"] for i in pedido["items"]}
+                nombre_a_quitar = col_sel.selectbox(
+                    "Ítem para quitar", list(opciones_quitar.keys()), key="sel_quitar_item_pedido"
+                )
+                if col_btn.button("Quitar ítem", type="secondary"):
+                    try:
+                        mod_pedidos.quitar_item_pedido(pedido_id, opciones_quitar[nombre_a_quitar])
+                        st.toast(f"'{nombre_a_quitar}' quitado del pedido.")
+                        st.rerun()
+                    except Exception as e:
+                        mostrar_error(e)
 
     elif vista == "Detalle / Cobrar":
         opcion_filtro = st.selectbox(
