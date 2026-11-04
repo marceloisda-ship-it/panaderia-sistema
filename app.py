@@ -15,7 +15,7 @@ from datetime import date, timedelta
 import pandas as pd
 import streamlit as st
 
-from db import inicializar_db
+from db import inicializar_db, VERSION_ESQUEMA
 import auth
 import ingredientes as mod_ing
 import recetas as mod_rec
@@ -35,18 +35,22 @@ if not st.session_state.get("usuario"):
 
 
 @st.cache_resource
-def _inicializar_db_una_vez():
+def _inicializar_db_una_vez(version_esquema: int):
     # Streamlit vuelve a ejecutar todo este script en cada interacción
     # (incluido cambiar de pestaña en el sidebar) — sin este cache,
     # inicializar_db() mandaría ~14 sentencias SQL (crear las 11 tablas +
     # 3 inserts de configuración) contra Supabase en cada click, aunque
     # el esquema ya exista (~2s de más por navegación). Con @st.cache_resource
     # corre una sola vez por proceso, no una vez por rerun.
+    #
+    # `version_esquema` es la clave del caché: al subir VERSION_ESQUEMA en
+    # db.py vuelve a correr aunque Streamlit Cloud no reinicie el proceso
+    # tras un push (que solo recarga el código y conserva el caché).
     inicializar_db()
     return True
 
 
-_inicializar_db_una_vez()
+_inicializar_db_una_vez(VERSION_ESQUEMA)
 
 
 # --- Helpers comunes -----------------------------------------------------

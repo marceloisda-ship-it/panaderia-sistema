@@ -16,6 +16,13 @@ sale ~800ms por el handshake — con el pool baja a ~10-20ms).
 
 import uuid
 
+# Subir este número cada vez que inicializar_db() cambie el esquema
+# (tabla, columna o migración nueva). app.py lo usa como clave del caché
+# de la inicialización: Streamlit Cloud, al recibir un push, recarga el
+# código sin reiniciar el proceso, y sin esta clave el caché viejo hacía
+# que la migración nueva nunca corriera (pasó el 2026-11-04).
+VERSION_ESQUEMA = 2
+
 import streamlit as st
 import psycopg2
 import psycopg2.extras
