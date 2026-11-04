@@ -198,7 +198,10 @@ fijo relevante. Si eso cambia, se puede ampliar el mismo mecanismo.
       tiempo de preparación) incorporados al costeo de cada receta.
 - [x] **Pedidos**: capacidad máxima de producción diaria (basada en
       tiempo), pedidos por cliente con fecha de entrega, aviso de
-      sobreventa, y cobro que genera el ingreso en Caja automáticamente.
+      sobreventa, flujo de estados (recibido → confirmado → en producción
+      → listo → entregado) con canal de origen, y entrega y pago por
+      separado: el pago genera el ingreso en Caja automáticamente y los
+      entregados sin pagar quedan en la vista **Por cobrar**.
 - [x] **Clientes**: ficha de cliente (nombre, teléfono, dirección,
       notas), historial de pedidos, y reportes de inteligencia de negocio
       (quién compra más, qué pan se pide más).
@@ -244,25 +247,25 @@ usable por sí sola. Se marca con `[x]` a medida que se va completando.
 
 La base de todo lo demás: que el sistema refleje el flujo ideal.
 
-- [ ] Estados nuevos: `recibido`, `confirmado`, `en producción`, `listo`,
+- [x] Estados nuevos: `recibido`, `confirmado`, `en producción`, `listo`,
       `entregado`, `cancelado` (hoy solo existen pendiente, confirmado,
       entregado y cancelado). Revisar si la base tiene restricciones
       sobre los valores permitidos y migrar los pedidos existentes.
-- [ ] Guardar el **canal de origen** del pedido (WhatsApp, presencial,
+- [x] Guardar el **canal de origen** del pedido (WhatsApp, presencial,
       Instagram).
-- [ ] **Separar entrega de pago.** Hoy `entregar_y_cobrar` hace las dos
+- [x] **Separar entrega de pago.** Hoy `entregar_y_cobrar` hace las dos
       cosas a la vez; debe poder marcarse *entregado* sin pago, y
       registrar el pago después (generando igual el ingreso en Caja y la
       comisión, si aplica).
-- [ ] Mostrar los estados nuevos en el calendario de Planificación.
+- [x] Mostrar los estados nuevos en el calendario de Planificación.
 
 ### Etapa 2 — Cobranza
 
-- [ ] Vista **Por cobrar**: pedidos entregados sin pagar, con los días
+- [x] Vista **Por cobrar**: pedidos entregados sin pagar, con los días
       transcurridos desde la entrega y el monto adeudado.
-- [ ] Configurar **a los cuántos días** se considera que corresponde
+- [x] Configurar **a los cuántos días** se considera que corresponde
       recordar el pago (sin plazo fijo de pago, solo el aviso).
-- [ ] Reutilizar el mensaje de recordatorio de pago que ya existe
+- [x] Reutilizar el mensaje de recordatorio de pago que ya existe
       (detalle del pedido y medios de pago).
 
 ### Etapa 3 — Producción con 3 panificadoras

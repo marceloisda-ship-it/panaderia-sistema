@@ -12,21 +12,62 @@ precio posterior no altere pedidos ya tomados.
 Cada pedido pertenece a un cliente de la ficha de clientes (ver
 clientes.py) — ya no se guarda como texto libre.
 
-Al marcar un pedido como entregado y pagado (`entregar_y_cobrar`), se
-genera automáticamente el ingreso correspondiente en Flujo de caja
-(ver caja.py) con el medio de pago indicado, para no tener que
-registrarlo dos veces.
+Flujo de estados (ver README, "Flujo ideal de un pedido"):
+
+    recibido → confirmado → en_produccion → listo → entregado
+    (cualquiera de los abiertos puede pasar a cancelado)
+
+El pago es un eje aparte del estado: un pedido puede estar entregado y
+todavía sin pagar, o pagado por adelantado antes de entregarse.
+`marcar_entregado` y `registrar_pago` son acciones independientes;
+`entregar_y_cobrar` hace las dos juntas (el caso de pago al recibir).
+Al registrar el pago se genera automáticamente el ingreso en Flujo de
+caja (ver caja.py) y, si aplica, el gasto por comisión.
 """
 
 from datetime import date, datetime, timedelta
 from db import conectar, cache_lectura
 import caja as mod_caja
 
-ESTADOS_VALIDOS = ("pendiente", "confirmado", "entregado", "cancelado")
+ESTADOS_VALIDOS = ("recibido", "confirmado", "en_produccion", "listo", "entregado", "cancelado")
+# Estados de un pedido "vivo": todavía se puede editar, reagendar o cancelar.
+ESTADOS_ABIERTOS = ("recibido", "confirmado", "en_produccion", "listo")
+ETIQUETAS_ESTADO = {
+    "recibido": "Recibido",
+    "confirmado": "Confirmado",
+    "en_produccion": "En producción",
+    "listo": "Listo",
+    "entregado": "Entregado",
+    "cancelado": "Cancelado",
+}
+# Paso siguiente natural de cada estado abierto (para el botón "avanzar").
+SIGUIENTE_ESTADO = {
+    "recibido": "confirmado",
+    "confirmado": "en_produccion",
+    "en_produccion": "listo",
+    "listo": "entregado",
+}
+
+CANALES_VALIDOS = ("whatsapp", "presencial", "instagram", "otro")
+ETIQUETAS_CANAL = {
+    "whatsapp": "WhatsApp",
+    "presencial": "Presencial",
+    "instagram": "Instagram",
+    "otro": "Otro",
+}
 
 
-def crear_pedido(cliente_id: int, fecha_entrega: str, notas: str | None = None) -> int:
-    """Crea un nuevo pedido (sin ítems todavía) y retorna su id."""
+def etiqueta_estado(estado: str) -> str:
+    return ETIQUETAS_ESTADO.get(estado, estado)
+
+
+def crear_pedido(cliente_id: int, fecha_entrega: str, notas: str | None = None,
+                 canal_origen: str | None = None) -> int:
+    """Crea un nuevo pedido (sin ítems todavía) en estado 'recibido' y
+    retorna su id. `canal_origen` indica por dónde llegó (WhatsApp,
+    presencial, Instagram u otro)."""
+    if canal_origen is not None and canal_origen not in CANALES_VALIDOS:
+        raise ValueError(f"canal_origen debe ser uno de {CANALES_VALIDOS}")
     fecha_creacion = datetime.now().isoformat(timespec="seconds")
     conn = conectar()
     try:
@@ -36,10 +77,11 @@ def crear_pedido(cliente_id: int, fecha_entrega: str, notas: str | None = None) 
 
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO pedidos (cliente_id, fecha_entrega, estado, pagado, notas, fecha_creacion)
-               VALUES (%s, %s, 'pendiente', FALSE, %s, %s)
+            """INSERT INTO pedidos (cliente_id, fecha_entrega, estado, pagado, notas,
+                                    fecha_creacion, canal_origen)
+               VALUES (%s, %s, 'recibido', FALSE, %s, %s, %s)
                RETURNING id""",
-            (cliente_id, fecha_entrega, notas, fecha_creacion),
+            (cliente_id, fecha_entrega, notas, fecha_creacion, canal_origen),
         )
         pedido_id = cursor.fetchone()["id"]
         conn.commit()
@@ -179,6 +221,21 @@ def generar_resumen_whatsapp(pedido_id: int) -> str:
     return "\n".join(lineas)
 
 
+def generar_mensaje_listo_whatsapp(pedido_id: int) -> str:
+    """Genera el aviso de que el pedido ya está listo (paso 4 del flujo),
+    para coordinar la entrega."""
+    pedido = detalle_pedido(pedido_id)
+
+    lineas = _encabezado_whatsapp(pedido, pedido_id, "¡Tu pedido ya está listo! 🥖✨")
+    for item in pedido["items"]:
+        lineas.append(f"- {item['cantidad']} x {item['nombre']}")
+    lineas.append("")
+    lineas.append(f"💰 *Total: {_formato_pesos(pedido['total'])}*")
+    lineas.append("")
+    lineas.append("Te escribimos para coordinar la entrega. ¡Gracias! 😊")
+    return "\n".join(lineas)
+
+
 def generar_mensaje_cobro_whatsapp(pedido_id: int) -> str:
     """Genera un mensaje de aviso de entrega con el monto a pagar al
     recibir el pedido, con tono cercano y listo para copiar y pegar en
@@ -208,6 +265,11 @@ def generar_recordatorio_pago_whatsapp(pedido_id: int) -> str:
         lineas.append(f"- {item['cantidad']} x {item['nombre']} — {_formato_pesos(item['subtotal'])}")
     lineas.append("")
     lineas.append(f"💰 *Total pendiente: {_formato_pesos(pedido['total'])}*")
+    lineas.append("")
+    lineas.append(
+        "💳 Puedes pagar por transferencia, en efectivo o con débito/crédito. "
+        "Si prefieres transferir, avísame y te envío los datos."
+    )
     lineas.append("")
     lineas.append("Si ya lo pagaste, ignora este mensaje. ¡Muchas gracias! 😊")
     return "\n".join(lineas)
@@ -304,6 +366,53 @@ def _listar_pedidos_con_items(condiciones: list[str], parametros: list, orden: s
 
 
 @cache_lectura
+def obtener_configuracion_cobranza() -> dict:
+    conn = conectar()
+    try:
+        fila = conn.execute(
+            "SELECT dias_recordatorio FROM configuracion_cobranza WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    return dict(fila) if fila else {"dias_recordatorio": 3}
+
+
+def actualizar_dias_recordatorio(dias: int) -> None:
+    """A los cuántos días desde la entrega un pedido sin pagar pasa a
+    "toca recordar". No es un plazo de pago: solo el umbral del aviso."""
+    if dias < 0:
+        raise ValueError("Los días no pueden ser negativos")
+    conn = conectar()
+    try:
+        conn.execute(
+            """INSERT INTO configuracion_cobranza (id, dias_recordatorio) VALUES (1, %s)
+               ON CONFLICT (id) DO UPDATE SET dias_recordatorio = excluded.dias_recordatorio""",
+            (int(dias),),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@cache_lectura
+def listar_por_cobrar() -> list[dict]:
+    """Pedidos entregados y todavía sin pagar, del más antiguo al más
+    reciente. Cada uno trae `dias_desde_entrega` y `toca_recordar` (si ya
+    pasaron los días configurados en `configuracion_cobranza`)."""
+    pedidos = _listar_pedidos_con_items(
+        ["p.estado = 'entregado'", "NOT p.pagado"], [],
+        "COALESCE(p.fecha_entregado, p.fecha_entrega) ASC, p.id ASC",
+    )
+    umbral = obtener_configuracion_cobranza()["dias_recordatorio"]
+    hoy = date.today()
+    for p in pedidos:
+        entregado = date.fromisoformat(p["fecha_entregado"] or p["fecha_entrega"])
+        p["dias_desde_entrega"] = (hoy - entregado).days
+        p["toca_recordar"] = p["dias_desde_entrega"] >= umbral
+    return pedidos
+
+
+@cache_lectura
 def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
     """Retorna id, cliente, fecha de entrega y estado de cada pedido, sin
     traer ítems ni calcular el total.
@@ -313,7 +422,7 @@ def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
     a recetas — correcto para las vistas que muestran el detalle, pero de
     más para solo armar una lista de nombres en un `st.selectbox` (cada
     connect/query de más contra Supabase suma latencia real de red)."""
-    query = """SELECT p.id, p.fecha_entrega, p.estado, c.nombre AS cliente_nombre
+    query = """SELECT p.id, p.fecha_entrega, p.estado, p.pagado, c.nombre AS cliente_nombre
                FROM pedidos p
                JOIN clientes c ON c.id = p.cliente_id"""
     parametros = []
@@ -330,15 +439,25 @@ def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
 
 
 def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
+    """Mueve un pedido abierto a otro estado abierto (recibido,
+    confirmado, en producción, listo) o lo cancela. Se permite volver
+    atrás (ej. de 'listo' a 'en producción') para corregir un error.
+
+    Para entregar se usa `marcar_entregado` (o `entregar_y_cobrar`), que
+    además registran la fecha de entrega. Un pedido ya entregado o
+    cancelado no cambia de estado."""
     if nuevo_estado not in ESTADOS_VALIDOS:
         raise ValueError(f"estado debe ser uno de {ESTADOS_VALIDOS}")
+    if nuevo_estado == "entregado":
+        raise ValueError("Para entregar un pedido usa 'Marcar entregado'")
     conn = conectar()
     try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM pedidos WHERE id = %s", (pedido_id,))
-        if cursor.fetchone() is None:
+        fila = conn.execute("SELECT estado FROM pedidos WHERE id = %s", (pedido_id,)).fetchone()
+        if fila is None:
             raise ValueError(f"No existe un pedido con id {pedido_id}")
-        cursor.execute("UPDATE pedidos SET estado = %s WHERE id = %s", (nuevo_estado, pedido_id))
+        if fila["estado"] not in ESTADOS_ABIERTOS:
+            raise ValueError(f"El pedido ya está '{etiqueta_estado(fila['estado'])}', no cambia de estado")
+        conn.execute("UPDATE pedidos SET estado = %s WHERE id = %s", (nuevo_estado, pedido_id))
         conn.commit()
     finally:
         conn.close()
@@ -421,9 +540,78 @@ def reagendar_pedidos_por_fecha(fecha_actual: str, nueva_fecha_entrega: str) -> 
         conn.close()
 
 
-def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None) -> dict:
-    """Marca el pedido como entregado y pagado, y genera automáticamente
-    el ingreso correspondiente en Flujo de caja por el total del pedido.
+def _validar_entregable(detalle: dict) -> None:
+    if detalle["estado"] == "entregado":
+        raise ValueError("Este pedido ya fue marcado como entregado")
+    if detalle["estado"] == "cancelado":
+        raise ValueError("No se puede entregar un pedido cancelado")
+    if not detalle["items"]:
+        raise ValueError("El pedido no tiene ítems, no hay nada que entregar")
+
+
+def _validar_cobrable(detalle: dict, medio_pago: str) -> None:
+    if medio_pago not in mod_caja.MEDIOS_VALIDOS:
+        raise ValueError(f"medio_pago debe ser uno de {mod_caja.MEDIOS_VALIDOS}")
+    if detalle["pagado"]:
+        raise ValueError("Este pedido ya está pagado")
+    if detalle["estado"] == "cancelado":
+        raise ValueError("No se puede cobrar un pedido cancelado")
+    if not detalle["items"]:
+        raise ValueError("El pedido no tiene ítems, no hay nada que cobrar")
+
+
+def _registrar_pago_en_conn(conn, detalle: dict, pedido_id: int, medio_pago: str, fecha: str) -> dict:
+    """Marca el pedido como pagado y genera el ingreso (y la comisión, si
+    aplica) en Caja, usando la conexión/transacción de quien llama."""
+    comision = mod_caja.calcular_comision(detalle["total"], medio_pago)
+    conn.execute(
+        "UPDATE pedidos SET pagado = TRUE, medio_pago = %s, fecha_pago = %s WHERE id = %s",
+        (medio_pago, fecha, pedido_id),
+    )
+    movimiento_ingreso_id = mod_caja.registrar_movimiento(
+        "ingreso", detalle["total"], medio_pago,
+        categoria="Pedido",
+        descripcion=f"Pedido #{pedido_id} - {detalle['cliente_nombre']}",
+        fecha=fecha,
+        conn=conn,
+    )
+    movimiento_gasto_comision_id = None
+    if comision > 0:
+        movimiento_gasto_comision_id = mod_caja.registrar_movimiento(
+            "gasto", comision, medio_pago,
+            categoria="Comisión Mercado Pago",
+            descripcion=f"Comisión {medio_pago} - Pedido #{pedido_id} - {detalle['cliente_nombre']}",
+            fecha=fecha,
+            conn=conn,
+        )
+    return {
+        "movimiento_ingreso_id": movimiento_ingreso_id,
+        "comision": comision,
+        "movimiento_gasto_comision_id": movimiento_gasto_comision_id,
+    }
+
+
+def marcar_entregado(pedido_id: int, fecha: str | None = None) -> None:
+    """Marca el pedido como entregado (sin tocar el pago). Si todavía no
+    está pagado queda "por cobrar" hasta que se use `registrar_pago`."""
+    detalle = _detalle_pedido_sin_cache(pedido_id)
+    _validar_entregable(detalle)
+    fecha = fecha or date.today().isoformat()
+    conn = conectar()
+    try:
+        conn.execute(
+            "UPDATE pedidos SET estado = 'entregado', fecha_entregado = %s WHERE id = %s",
+            (fecha, pedido_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def registrar_pago(pedido_id: int, medio_pago: str, fecha: str | None = None) -> dict:
+    """Registra el pago de un pedido (entregado o no: puede ser un pago
+    por adelantado) y genera automáticamente el ingreso en Flujo de caja
+    por el total del pedido.
 
     Si se cobra con débito o crédito, además registra un gasto aparte por
     la comisión que descuenta el medio de pago electrónico (ver
@@ -434,65 +622,50 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
     Retorna un dict con movimiento_ingreso_id, comision (0 si no aplica)
     y movimiento_gasto_comision_id (None si no aplica).
 
-    No se puede llamar dos veces sobre el mismo pedido (evita duplicar
-    el ingreso en caja), ni sobre un pedido cancelado o sin ítems.
-
-    Todo (marcar el pedido como pagado + el/los movimiento(s) en caja)
-    queda en una sola transacción: si algo falla a mitad de camino, se
-    deshace todo — nunca queda un pedido marcado como pagado sin su
-    ingreso en caja, ni viceversa.
+    No se puede pagar dos veces el mismo pedido (evita duplicar el
+    ingreso en caja), ni un pedido cancelado o sin ítems. Marcar pagado +
+    movimiento(s) en caja van en una sola transacción: nunca queda un
+    pedido pagado sin su ingreso, ni viceversa.
     """
-    if medio_pago not in mod_caja.MEDIOS_VALIDOS:
-        raise ValueError(f"medio_pago debe ser uno de {mod_caja.MEDIOS_VALIDOS}")
-
     detalle = _detalle_pedido_sin_cache(pedido_id)
-    if detalle["estado"] == "entregado" and detalle["pagado"]:
-        raise ValueError("Este pedido ya fue marcado como entregado y pagado")
-    if detalle["estado"] == "cancelado":
-        raise ValueError("No se puede cobrar un pedido cancelado")
-    if not detalle["items"]:
-        raise ValueError("El pedido no tiene ítems, no hay nada que cobrar")
-
+    _validar_cobrable(detalle, medio_pago)
     fecha = fecha or date.today().isoformat()
-    comision = mod_caja.calcular_comision(detalle["total"], medio_pago)
 
     conn = conectar()
     try:
-        conn.execute(
-            "UPDATE pedidos SET estado = 'entregado', pagado = TRUE, medio_pago = %s WHERE id = %s",
-            (medio_pago, pedido_id),
-        )
-
-        movimiento_ingreso_id = mod_caja.registrar_movimiento(
-            "ingreso", detalle["total"], medio_pago,
-            categoria="Pedido",
-            descripcion=f"Pedido #{pedido_id} - {detalle['cliente_nombre']}",
-            fecha=fecha,
-            conn=conn,
-        )
-
-        movimiento_gasto_comision_id = None
-        if comision > 0:
-            movimiento_gasto_comision_id = mod_caja.registrar_movimiento(
-                "gasto", comision, medio_pago,
-                categoria="Comisión Mercado Pago",
-                descripcion=f"Comisión {medio_pago} - Pedido #{pedido_id} - {detalle['cliente_nombre']}",
-                fecha=fecha,
-                conn=conn,
-            )
-
+        resultado = _registrar_pago_en_conn(conn, detalle, pedido_id, medio_pago, fecha)
         conn.commit()
     except Exception:
         conn.rollback()
         raise
     finally:
         conn.close()
+    return resultado
 
-    return {
-        "movimiento_ingreso_id": movimiento_ingreso_id,
-        "comision": comision,
-        "movimiento_gasto_comision_id": movimiento_gasto_comision_id,
-    }
+
+def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None) -> dict:
+    """Atajo para el caso en que el cliente paga al recibir: marca el
+    pedido como entregado y registra el pago (ingreso en Caja + comisión)
+    en una sola transacción. Retorna lo mismo que `registrar_pago`."""
+    detalle = _detalle_pedido_sin_cache(pedido_id)
+    _validar_entregable(detalle)
+    _validar_cobrable(detalle, medio_pago)
+    fecha = fecha or date.today().isoformat()
+
+    conn = conectar()
+    try:
+        conn.execute(
+            "UPDATE pedidos SET estado = 'entregado', fecha_entregado = %s WHERE id = %s",
+            (fecha, pedido_id),
+        )
+        resultado = _registrar_pago_en_conn(conn, detalle, pedido_id, medio_pago, fecha)
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+    return resultado
 
 
 @cache_lectura

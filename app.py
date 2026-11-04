@@ -107,17 +107,61 @@ def selector_cliente(label: str, key: str):
     return opciones[elegido]
 
 
-def selector_pedido(label: str, key: str, estado: str | None = None):
+def selector_pedido(label: str, key: str, estado: str | None = None, filtro=None):
+    """`filtro` (opcional) recibe cada pedido resumido y decide si se
+    muestra, para filtros que no son un solo estado (ej. "por cobrar")."""
     pedidos = mod_pedidos.listar_pedidos_resumen(estado=estado)
+    if filtro is not None:
+        pedidos = [p for p in pedidos if filtro(p)]
     if not pedidos:
         st.info("No hay pedidos para mostrar.")
         return None
     opciones = {
-        f"#{p['id']} · {p['cliente_nombre']} · entrega {p['fecha_entrega']} · {p['estado']}": p["id"]
+        f"#{p['id']} · {p['cliente_nombre']} · entrega {p['fecha_entrega']} · "
+        f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}": p["id"]
         for p in pedidos
     }
     elegido = st.selectbox(label, list(opciones.keys()), key=key)
     return opciones[elegido]
+
+
+def _marca_pago(p: dict) -> str:
+    """Sufijo para títulos de pedidos: pagado, o por cobrar si ya se
+    entregó sin pago."""
+    if p["pagado"]:
+        return " · pagado"
+    if p["estado"] == "entregado":
+        return " · por cobrar"
+    return ""
+
+
+def _es_por_cobrar(p: dict) -> bool:
+    return p["estado"] == "entregado" and not p["pagado"]
+
+
+# Filtros de pedidos que no son un estado único (Agenda y Detalle).
+_FILTRO_ABIERTOS = "Abiertos (sin entregar)"
+_FILTRO_POR_COBRAR = "Por cobrar (entregados sin pago)"
+_FILTRO_TODOS = "(todos)"
+
+
+def _opciones_filtro_pedidos() -> list[str]:
+    return [_FILTRO_ABIERTOS, _FILTRO_POR_COBRAR, _FILTRO_TODOS] + [
+        mod_pedidos.etiqueta_estado(e) for e in mod_pedidos.ESTADOS_VALIDOS
+    ]
+
+
+def _aplicar_filtro_pedidos(opcion: str):
+    """Traduce una opción de `_opciones_filtro_pedidos` a (estado, filtro)
+    para `listar_pedidos` / `selector_pedido`."""
+    if opcion == _FILTRO_ABIERTOS:
+        return None, lambda p: p["estado"] in mod_pedidos.ESTADOS_ABIERTOS
+    if opcion == _FILTRO_POR_COBRAR:
+        return "entregado", lambda p: not p["pagado"]
+    if opcion == _FILTRO_TODOS:
+        return None, None
+    estado = next(e for e in mod_pedidos.ESTADOS_VALIDOS if mod_pedidos.etiqueta_estado(e) == opcion)
+    return estado, None
 
 
 # --- Sección: Ingredientes ------------------------------------------------
@@ -605,7 +649,7 @@ def seccion_caja():
     elif vista == "Comisiones":
         st.caption(
             "Tasas que cobra el medio de pago electrónico (ej. Mercado Pago Point) al "
-            "cobrar con tarjeta. Al marcar un pedido como 'entregado y cobrado' con débito "
+            "cobrar con tarjeta. Al registrar el pago de un pedido con débito "
             "o crédito, se registra automáticamente un gasto aparte por esta comisión, "
             "junto al ingreso por el total del pedido. Actualiza estos valores el día que "
             "cambies de tramo de ventas con el proveedor. La transferencia y el efectivo "
@@ -700,11 +744,21 @@ def seccion_costos_indirectos():
 # --- Sección: Pedidos ------------------------------------------------------
 
 _ESTADOS_CALENDARIO = (
-    ("pendiente", "Pendiente", "#e0a100"),
-    ("confirmado", "Confirmado", "#2f7fd8"),
-    ("entregado", "Entregado", "#2e9e5b"),
+    ("recibido", "Recibido", "#e0a100", "🟡"),
+    ("confirmado", "Confirmado", "#2f7fd8", "🔵"),
+    ("en_produccion", "En producción", "#e06a1f", "🟠"),
+    ("listo", "Listo", "#8a4fd0", "🟣"),
+    ("entregado", "Entregado", "#2e9e5b", "🟢"),
 )
 _DIAS_SEMANA = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+
+def _plural_estado(nombre: str, cantidad: int) -> str:
+    """'2 listos', '3 en producción' (lo que lleva 'en' no se pluraliza)."""
+    nombre = nombre.lower()
+    if cantidad > 1 and not nombre.startswith("en "):
+        nombre += "s"
+    return nombre
 
 
 def _calendario_html(anio: int, mes: int, pedidos_por_dia: dict, minutos_por_dia: dict,
@@ -746,8 +800,8 @@ def _calendario_html(anio: int, mes: int, pedidos_por_dia: dict, minutos_por_dia
             if disponible_min > 0 and minutos_por_dia.get(iso, 0) > disponible_min:
                 clases += " sobre"
             chips = "".join(
-                f'<span class="chip" style="background:{color}">{pedidos_por_dia.get(iso, {}).get(clave)} {nombre.lower()}{"s" if pedidos_por_dia[iso][clave] > 1 else ""}</span>'
-                for clave, nombre, color in _ESTADOS_CALENDARIO
+                f'<span class="chip" style="background:{color}">{pedidos_por_dia[iso][clave]} {_plural_estado(nombre, pedidos_por_dia[iso][clave])}</span>'
+                for clave, nombre, color, _ in _ESTADOS_CALENDARIO
                 if pedidos_por_dia.get(iso, {}).get(clave)
             )
             partes.append(f'<div class="{clases}"><span class="cal-n">{d.day}</span>{chips}</div>')
@@ -801,19 +855,27 @@ def _vista_planificacion():
         unsafe_allow_html=True,
     )
     st.caption(
-        "🟡 Pendiente · 🔵 Confirmado · 🟢 Entregado — borde rojo: día sobrevendido "
-        "(más trabajo que horas disponibles). Los pedidos cancelados no se cuentan."
+        " · ".join(f"{emoji} {nombre}" for _, nombre, _, emoji in _ESTADOS_CALENDARIO)
+        + " — borde rojo: día sobrevendido (más trabajo que horas disponibles). "
+        "Los pedidos cancelados no se cuentan."
     )
 
     # --- Resumen del mes ---------------------------------------------------
     st.divider()
     st.subheader(f"Resumen de {NOMBRES_MESES[ref.month - 1].lower()}")
-    conteo = {clave: sum(1 for p in pedidos_mes if p["estado"] == clave) for clave, _, _ in _ESTADOS_CALENDARIO}
-    c1, c2, c3, c4 = st.columns(4)
+    conteo = {clave: sum(1 for p in pedidos_mes if p["estado"] == clave) for clave, *_ in _ESTADOS_CALENDARIO}
+    por_cobrar = [p for p in pedidos_mes if _es_por_cobrar(p)]
+    c1, c2, c3 = st.columns(3)
     c1.metric("Pedidos del mes", len(pedidos_mes))
-    c2.metric("🟡 Pendientes", conteo["pendiente"])
+    c2.metric("🟡 Recibidos", conteo["recibido"])
     c3.metric("🔵 Confirmados", conteo["confirmado"])
-    c4.metric("🟢 Entregados", conteo["entregado"])
+    c4, c5, c6 = st.columns(3)
+    c4.metric("🟠 En producción", conteo["en_produccion"])
+    c5.metric("🟣 Listos", conteo["listo"])
+    c6.metric("🟢 Entregados", conteo["entregado"])
+    if por_cobrar:
+        monto_por_cobrar = f"${sum(p['total'] for p in por_cobrar):,.0f}".replace(",", ".")
+        st.caption(f"💸 {len(por_cobrar)} pedido(s) entregado(s) sin pagar este mes, por {monto_por_cobrar}.")
 
     # Tiempo: solo de hoy en adelante (lo ya pasado no se puede "usar").
     desde_tiempo = max(primer_dia, hoy)
@@ -861,7 +923,8 @@ def _vista_planificacion():
 
         st.markdown("**Pedidos de ese día**")
         for p in resumen["pedidos"]:
-            with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"):
+            with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · "
+                             f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}"):
                 st.dataframe(pd.DataFrame(p["items"]), width='stretch', hide_index=True)
                 if p["notas"]:
                     st.caption(f"Notas: {p['notas']}")
@@ -869,14 +932,271 @@ def _vista_planificacion():
         st.info("No hay pedidos para este día.")
 
 
+_PASOS_FLUJO = ("recibido", "confirmado", "en_produccion", "listo", "entregado")
+
+# Botón y explicación para avanzar al estado siguiente (ver SIGUIENTE_ESTADO).
+_TEXTO_AVANZAR = {
+    "confirmado": ("✅ Confirmar pedido", "El cliente ya recibió el detalle del pedido y lo aceptó."),
+    "en_produccion": ("🔥 Pasar a producción", "Las cubetas ya están armadas y el pan horneando."),
+    "listo": ("🥖 Marcar listo", "El pan ya salió. Después avísale al cliente para coordinar la entrega."),
+}
+
+
+def _linea_estado_pago(pedido: dict) -> str:
+    partes = [f"Estado: {mod_pedidos.etiqueta_estado(pedido['estado'])}"]
+    if pedido["pagado"]:
+        detalle_pago = f"Pagado ({pedido['medio_pago']}"
+        if pedido.get("fecha_pago"):
+            detalle_pago += f", {pedido['fecha_pago']}"
+        partes.append(detalle_pago + ")")
+    else:
+        partes.append("Sin pagar" if pedido["estado"] != "entregado" else "💸 Por cobrar")
+    if pedido.get("fecha_entregado"):
+        partes.append(f"Entregado el {pedido['fecha_entregado']}")
+    if pedido.get("canal_origen"):
+        partes.append(f"Llegó por {mod_pedidos.ETIQUETAS_CANAL[pedido['canal_origen']]}")
+    return " · ".join(partes)
+
+
+def _expander_datos_transferencia(telefono: str | None):
+    with st.expander("Si el cliente va a transferir: datos para copiar"):
+        datos_transferencia = st.secrets.get("datos_transferencia")
+        if datos_transferencia:
+            mensaje_transferencia = mod_pedidos.generar_mensaje_datos_transferencia_whatsapp(
+                datos_transferencia["nombre"],
+                datos_transferencia["rut"],
+                datos_transferencia["tipo_cuenta"],
+                datos_transferencia["numero_cuenta"],
+                datos_transferencia["email"],
+            )
+            mensaje_whatsapp(mensaje_transferencia, telefono)
+        else:
+            st.warning(
+                "Configura tus datos de transferencia en .streamlit/secrets.toml "
+                "(sección [datos_transferencia]) para que aparezcan aquí."
+            )
+
+
+def _avisar_pago(pedido_id: int, medio: str, resultado: dict):
+    """Mensaje de éxito tras registrar un pago (con la comisión, si hubo)
+    y aviso automático por WhatsApp si la API está configurada."""
+    mensaje = f"Pago registrado. Ingreso #{resultado['movimiento_ingreso_id']} en Caja."
+    if resultado["comision"] > 0:
+        mensaje += (
+            f" Además, gasto de ${resultado['comision']:.2f} por comisión de {medio} "
+            f"(#{resultado['movimiento_gasto_comision_id']})."
+        )
+    st.toast(mensaje)
+    if mod_whatsapp.api_configurada():
+        try:
+            mod_whatsapp.enviar_pedido_pagado(pedido_id, medio)
+            st.toast("Avisado por WhatsApp.")
+        except mod_whatsapp.ErrorEnvioWhatsapp as e:
+            mostrar_aviso_whatsapp(e)
+
+
+def _bloque_estado_pedido(pedido_id: int, pedido: dict):
+    """Muestra en qué paso del flujo va el pedido y el botón para pasar
+    al siguiente (recibido → confirmado → en producción → listo)."""
+    estado = pedido["estado"]
+    st.subheader("Avance del pedido")
+    st.markdown(" → ".join(
+        f"**{mod_pedidos.etiqueta_estado(e)}**" if e == estado else mod_pedidos.etiqueta_estado(e)
+        for e in _PASOS_FLUJO
+    ))
+
+    siguiente = mod_pedidos.SIGUIENTE_ESTADO[estado]
+    if siguiente in _TEXTO_AVANZAR:
+        boton, ayuda = _TEXTO_AVANZAR[siguiente]
+        st.caption(ayuda)
+        if st.button(boton, type="primary", key="btn_avanzar_estado"):
+            try:
+                mod_pedidos.actualizar_estado(pedido_id, siguiente)
+                st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(siguiente)}.")
+            except Exception as e:
+                mostrar_error(e)
+            else:
+                if siguiente == "confirmado" and mod_whatsapp.api_configurada():
+                    try:
+                        mod_whatsapp.enviar_pedido_confirmado(pedido_id)
+                        st.toast("Avisado por WhatsApp.")
+                    except mod_whatsapp.ErrorEnvioWhatsapp as e:
+                        mostrar_aviso_whatsapp(e)
+                st.rerun()
+    else:
+        st.caption("Ya está listo: avísale al cliente y márcalo como entregado más abajo.")
+
+    if estado == "listo" and pedido["items"]:
+        st.caption("Mensaje para avisar que el pedido está listo:")
+        mensaje_whatsapp(mod_pedidos.generar_mensaje_listo_whatsapp(pedido_id), pedido["cliente_telefono"])
+
+    with st.expander("Corregir estado"):
+        st.caption("Para deshacer un paso marcado por error, o saltarse alguno.")
+        opciones = [e for e in mod_pedidos.ESTADOS_ABIERTOS if e != estado]
+        nuevo = st.selectbox("Mover a", opciones, format_func=mod_pedidos.etiqueta_estado,
+                             key="sel_corregir_estado")
+        if st.button("Cambiar estado", key="btn_corregir_estado"):
+            try:
+                mod_pedidos.actualizar_estado(pedido_id, nuevo)
+                st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(nuevo)}.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
+
+
+def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
+    """Marcar entregado, con o sin pago en el momento."""
+    st.subheader("Entregar")
+    if pedido["pagado"]:
+        st.caption("Este pedido ya está pagado: solo queda marcarlo como entregado.")
+    else:
+        st.caption(
+            "Si el cliente paga al recibir, márcalo aquí mismo y se registra el ingreso en Caja. "
+            "Si no, queda como **por cobrar** y el pago se registra después."
+        )
+        if pedido["items"]:
+            st.caption("Mensaje para avisar la entrega y el monto a pagar:")
+            mensaje_whatsapp(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), pedido["cliente_telefono"])
+            _expander_datos_transferencia(pedido["cliente_telefono"])
+
+    with st.form("form_entregar_pedido"):
+        pago_al_recibir = False
+        medio = None
+        if not pedido["pagado"]:
+            pago_al_recibir = st.radio(
+                "¿Pagó al recibir?", [False, True],
+                format_func=lambda v: "Sí, pagó al recibir" if v else "No, queda por cobrar",
+                horizontal=True,
+            )
+            medio = st.selectbox("Medio de pago (si pagó)", mod_caja.MEDIOS_VALIDOS)
+        fecha = st.date_input("Fecha de entrega", value=date.today(), max_value=date.today())
+        enviado = st.form_submit_button("Marcar entregado")
+    if enviado:
+        try:
+            if pago_al_recibir:
+                resultado = mod_pedidos.entregar_y_cobrar(pedido_id, medio, fecha.isoformat())
+            else:
+                mod_pedidos.marcar_entregado(pedido_id, fecha.isoformat())
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            if pago_al_recibir:
+                _avisar_pago(pedido_id, medio, resultado)
+            else:
+                st.toast(f"Pedido #{pedido_id} entregado.")
+            st.rerun()
+
+
+def _bloque_registrar_pago(pedido_id: int, pedido: dict):
+    """Registrar el pago por separado: de un pedido ya entregado (por
+    cobrar) o por adelantado, antes de entregarlo."""
+    if pedido["estado"] == "entregado":
+        st.subheader("💸 Registrar pago")
+        dias = None
+        if pedido.get("fecha_entregado"):
+            dias = (date.today() - date.fromisoformat(pedido["fecha_entregado"])).days
+        st.caption(
+            "Entregado sin pago"
+            + (f" hace {dias} día(s)" if dias is not None else "")
+            + ". Usa el recordatorio de pago (arriba) para avisarle al cliente."
+        )
+        _expander_datos_transferencia(pedido["cliente_telefono"])
+        contenedor = st.container()
+    else:
+        contenedor = st.expander("💸 Registrar pago por adelantado (antes de entregar)")
+
+    with contenedor:
+        _form_registrar_pago(pedido_id, "detalle")
+
+
+def _form_registrar_pago(pedido_id: int, sufijo: str):
+    """Formulario medio + fecha → registrar_pago. `sufijo` distingue las
+    claves cuando hay varios en la misma pantalla (lista Por cobrar)."""
+    with st.form(f"form_registrar_pago_{sufijo}_{pedido_id}"):
+        col_medio, col_fecha = st.columns(2)
+        medio = col_medio.selectbox("Medio de pago", mod_caja.MEDIOS_VALIDOS,
+                                    key=f"medio_pago_{sufijo}_{pedido_id}")
+        fecha = col_fecha.date_input("Fecha del pago", value=date.today(), max_value=date.today(),
+                                     key=f"fecha_pago_{sufijo}_{pedido_id}")
+        enviado = st.form_submit_button("Registrar pago")
+    if enviado:
+        try:
+            resultado = mod_pedidos.registrar_pago(pedido_id, medio, fecha.isoformat())
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            _avisar_pago(pedido_id, medio, resultado)
+            st.rerun()
+
+
+def _vista_por_cobrar():
+    """Pedidos entregados sin pagar: cuánto se debe, hace cuántos días se
+    entregó, a cuáles ya toca recordarles el pago, y el mensaje listo."""
+    config = mod_pedidos.obtener_configuracion_cobranza()
+    pedidos = mod_pedidos.listar_por_cobrar()
+
+    total = sum(p["total"] for p in pedidos)
+    a_recordar = [p for p in pedidos if p["toca_recordar"]]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pedidos por cobrar", len(pedidos))
+    c2.metric("Monto adeudado", f"${total:,.0f}".replace(",", "."))
+    c3.metric("🔔 Toca recordar", len(a_recordar),
+              help=f"Entregados hace {config['dias_recordatorio']} día(s) o más.")
+
+    with st.expander(f"⚙️ Avisar a los {config['dias_recordatorio']} día(s) de la entrega"):
+        with st.form("form_config_cobranza"):
+            dias = st.number_input(
+                "Días desde la entrega para recordar el pago", min_value=0, step=1,
+                value=int(config["dias_recordatorio"]),
+                help="No es un plazo de pago: solo cuándo el sistema marca el pedido como 'toca recordar'.",
+            )
+            if st.form_submit_button("Guardar"):
+                try:
+                    mod_pedidos.actualizar_dias_recordatorio(int(dias))
+                    st.toast("Configuración de cobranza guardada.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
+
+    if not pedidos:
+        st.success("No hay pedidos por cobrar. 🎉")
+        return
+
+    _expander_datos_transferencia(None)
+    st.caption("Del más antiguo al más reciente. Abre uno para mandar el recordatorio o registrar el pago.")
+    for p in pedidos:
+        marca = "🔔 " if p["toca_recordar"] else ""
+        dias_txt = "hoy" if p["dias_desde_entrega"] == 0 else f"hace {p['dias_desde_entrega']} día(s)"
+        monto = f"${p['total']:,.0f}".replace(",", ".")
+        with st.expander(f"{marca}#{p['id']} · {p['cliente_nombre']} · {monto} · entregado {dias_txt}"):
+            st.caption("Recordatorio de pago:")
+            mensaje_whatsapp(mod_pedidos.generar_recordatorio_pago_whatsapp(p["id"]), p["cliente_telefono"])
+            if mod_whatsapp.api_configurada() and st.button(
+                "📲 Enviar automático (WhatsApp Business API)", key=f"btn_recordar_{p['id']}"
+            ):
+                try:
+                    mod_whatsapp.enviar_recordatorio_pago(p["id"])
+                    st.success("Recordatorio de pago enviado por WhatsApp.")
+                except mod_whatsapp.ErrorEnvioWhatsapp as e:
+                    mostrar_error(e)
+            _form_registrar_pago(p["id"], "por_cobrar")
+
+
 def seccion_pedidos():
     st.header("📋 Pedidos")
+    a_recordar = [p for p in mod_pedidos.listar_por_cobrar() if p["toca_recordar"]]
+    if a_recordar:
+        st.warning(
+            f"🔔 {len(a_recordar)} pedido(s) entregado(s) sin pagar ya pasaron el plazo de aviso. "
+            "Revísalos en **Por cobrar**."
+        )
     # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
     # pestañas en cada interacción, y contra Supabase eso son decenas de
     # consultas por click. Con este selector solo corre la sección activa.
     vista = st.radio(
         "Sección",
-        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Capacidad de producción"],
+        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Por cobrar",
+         "Capacidad de producción"],
         horizontal=True,
         label_visibility="collapsed",
         key="vista_pedidos",
@@ -885,27 +1205,22 @@ def seccion_pedidos():
     if vista == "Planificación":
         _vista_planificacion()
 
+    elif vista == "Por cobrar":
+        _vista_por_cobrar()
+
     elif vista == "Agenda":
         col1, col2, col3 = st.columns(3)
         desde = col1.date_input("Desde", value=None, key="ped_desde")
         hasta = col2.date_input("Hasta", value=None, key="ped_hasta")
-        opciones_estado = ["Pendientes y confirmados", "(todos)"] + list(mod_pedidos.ESTADOS_VALIDOS)
-        estado = col3.selectbox("Estado", opciones_estado, key="ped_filtro_estado")
-
-        if estado == "Pendientes y confirmados":
-            pedidos = [
-                p for p in mod_pedidos.listar_pedidos(
-                    desde=desde.isoformat() if desde else None,
-                    hasta=hasta.isoformat() if hasta else None,
-                )
-                if p["estado"] not in ("entregado", "cancelado")
-            ]
-        else:
-            pedidos = mod_pedidos.listar_pedidos(
-                desde=desde.isoformat() if desde else None,
-                hasta=hasta.isoformat() if hasta else None,
-                estado=None if estado == "(todos)" else estado,
-            )
+        opcion_filtro = col3.selectbox("Estado", _opciones_filtro_pedidos(), key="ped_filtro_estado")
+        estado, filtro = _aplicar_filtro_pedidos(opcion_filtro)
+        pedidos = mod_pedidos.listar_pedidos(
+            desde=desde.isoformat() if desde else None,
+            hasta=hasta.isoformat() if hasta else None,
+            estado=estado,
+        )
+        if filtro is not None:
+            pedidos = [p for p in pedidos if filtro(p)]
 
         if not pedidos:
             st.info("No hay pedidos en ese rango.")
@@ -917,9 +1232,8 @@ def seccion_pedidos():
                     fecha_agrupada = p["fecha_entrega"]
                     st.markdown(f"**📅 {fecha_agrupada}**")
 
-                titulo = f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"
-                if p["pagado"]:
-                    titulo += " · pagado"
+                titulo = (f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · "
+                          f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}")
                 with st.expander(titulo):
                     if p["items"]:
                         st.dataframe(
@@ -932,19 +1246,22 @@ def seccion_pedidos():
                         st.caption(f"Notas: {p['notas']}")
                     if p["cliente_telefono"]:
                         st.caption(f"Teléfono: {p['cliente_telefono']}")
+                    if p.get("canal_origen"):
+                        st.caption(f"Llegó por: {mod_pedidos.ETIQUETAS_CANAL[p['canal_origen']]}")
 
             with st.expander("Ver como tabla resumen"):
                 df = pd.DataFrame(pedidos)[
                     ["id", "fecha_entrega", "cliente_nombre", "cliente_telefono",
                      "estado", "pagado", "total"]
                 ]
+                df["estado"] = df["estado"].map(mod_pedidos.etiqueta_estado)
                 st.dataframe(df, width='stretch', hide_index=True)
 
         st.divider()
         st.subheader("Reagendar varios pedidos de un mismo día")
         st.caption(
             "Por ejemplo, si un día se cae la producción por fuerza mayor: mueve de una "
-            "sola vez todos los pedidos de ese día (pendientes/confirmados) a otra fecha."
+            "sola vez todos los pedidos de ese día (los que no estén entregados ni cancelados) a otra fecha."
         )
         col1, col2 = st.columns(2)
         fecha_origen = col1.date_input("Fecha actual de esos pedidos", value=date.today(), key="ped_reag_origen")
@@ -955,7 +1272,7 @@ def seccion_pedidos():
             if p["estado"] not in ("entregado", "cancelado")
         ]
         if not pedidos_a_mover:
-            st.info(f"No hay pedidos pendientes/confirmados el {fecha_origen.isoformat()} para reagendar.")
+            st.info(f"No hay pedidos sin entregar el {fecha_origen.isoformat()} para reagendar.")
         else:
             st.write(f"Se reagendarán **{len(pedidos_a_mover)}** pedido(s):")
             df_mover = pd.DataFrame(pedidos_a_mover)[
@@ -995,6 +1312,10 @@ def seccion_pedidos():
                 nuevo_telefono = st.text_input("Teléfono (opcional)", key="nuevo_cliente_telefono_pedido")
                 nuevo_direccion = st.text_input("Dirección (opcional)", key="nuevo_cliente_direccion_pedido")
             fecha_entrega = st.date_input("Fecha de entrega", value=date.today())
+            canal = st.selectbox(
+                "¿Por dónde llegó el pedido?", mod_pedidos.CANALES_VALIDOS,
+                format_func=lambda c: mod_pedidos.ETIQUETAS_CANAL[c], key="canal_pedido",
+            )
             notas = st.text_area("Notas (opcional)")
             enviado = st.form_submit_button("Crear pedido")
 
@@ -1007,7 +1328,9 @@ def seccion_pedidos():
                 elif cliente_id is None:
                     raise ValueError("Selecciona un cliente")
 
-                pedido_id = mod_pedidos.crear_pedido(cliente_id, fecha_entrega.isoformat(), notas or None)
+                pedido_id = mod_pedidos.crear_pedido(
+                    cliente_id, fecha_entrega.isoformat(), notas or None, canal_origen=canal
+                )
                 mensaje = f"Pedido #{pedido_id} creado. Agrégale ítems aquí mismo abajo."
                 if modo_cliente == "Crear nuevo":
                     mensaje = f"Cliente '{nuevo_nombre}' creado. " + mensaje
@@ -1066,7 +1389,7 @@ def seccion_pedidos():
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
             if pedido["estado"] in ("entregado", "cancelado"):
-                st.warning(f"Este pedido ya está '{pedido['estado']}', no se puede seguir editando.")
+                st.warning(f"Este pedido ya está '{mod_pedidos.etiqueta_estado(pedido['estado'])}', no se puede seguir editando.")
             else:
                 receta_id = selector_receta("Receta", "sel_receta_para_pedido")
                 if receta_id is not None:
@@ -1111,14 +1434,11 @@ def seccion_pedidos():
                             mostrar_error(e)
 
     elif vista == "Detalle / Cobrar":
-        opciones_estado_detalle = list(mod_pedidos.ESTADOS_VALIDOS) + ["(todos)"]
-        estado_filtro_detalle = st.selectbox(
-            "Filtrar por estado", opciones_estado_detalle, index=0, key="detalle_filtro_estado"
+        opcion_filtro = st.selectbox(
+            "Filtrar por estado", _opciones_filtro_pedidos(), index=0, key="detalle_filtro_estado"
         )
-        pedido_id = selector_pedido(
-            "Pedido", "sel_pedido_detalle",
-            estado=None if estado_filtro_detalle == "(todos)" else estado_filtro_detalle,
-        )
+        estado_filtro, filtro = _aplicar_filtro_pedidos(opcion_filtro)
+        pedido_id = selector_pedido("Pedido", "sel_pedido_detalle", estado=estado_filtro, filtro=filtro)
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
 
@@ -1126,7 +1446,7 @@ def seccion_pedidos():
             col1.metric("Cliente", pedido["cliente_nombre"])
             col2.metric("Fecha de entrega", pedido["fecha_entrega"])
             col3.metric("Total", f"${pedido['total']:.2f}")
-            st.caption(f"Estado: {pedido['estado']} · Pagado: {'sí' if pedido['pagado'] else 'no'}")
+            st.caption(_linea_estado_pago(pedido))
             if pedido["notas"]:
                 st.caption(f"Notas: {pedido['notas']}")
 
@@ -1164,7 +1484,13 @@ def seccion_pedidos():
                 with st.expander(f"Historial de WhatsApp ({len(historial_wsp)})"):
                     st.dataframe(pd.DataFrame(historial_wsp), width='stretch', hide_index=True)
 
-            if pedido["estado"] not in ("entregado", "cancelado"):
+            abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
+
+            if abierto:
+                st.divider()
+                _bloque_estado_pedido(pedido_id, pedido)
+
+                st.divider()
                 st.subheader("Reagendar")
                 st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
                 with st.form("form_reagendar_pedido"):
@@ -1176,86 +1502,29 @@ def seccion_pedidos():
                 if enviado:
                     try:
                         mod_pedidos.reagendar_pedido(pedido_id, nueva_fecha.isoformat())
-                        st.success(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
+                        st.toast(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
                         st.rerun()
                     except Exception as e:
                         mostrar_error(e)
 
-                if pedido["estado"] == "pendiente":
-                    st.divider()
-                    st.subheader("Confirmar pedido")
-                    st.caption("Marca el pedido como confirmado con el cliente (sin cobrarlo todavía).")
-                    if st.button("Confirmar pedido"):
-                        try:
-                            mod_pedidos.actualizar_estado(pedido_id, "confirmado")
-                            st.success(f"Pedido #{pedido_id} confirmado.")
-                        except Exception as e:
-                            mostrar_error(e)
-                        else:
-                            if mod_whatsapp.api_configurada():
-                                try:
-                                    mod_whatsapp.enviar_pedido_confirmado(pedido_id)
-                                    st.success("Avisado por WhatsApp.")
-                                except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                                    mostrar_aviso_whatsapp(e)
-                            st.rerun()
-
                 st.divider()
-                st.subheader("Entregar y cobrar")
-                st.caption("Marca el pedido como entregado y genera el ingreso en Flujo de caja automáticamente.")
+                _bloque_entregar_pedido(pedido_id, pedido)
 
-                st.caption("Mensaje para avisar la entrega y el monto a pagar:")
-                mensaje_whatsapp(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), pedido["cliente_telefono"])
-
-                with st.expander("Si el cliente va a transferir: datos para copiar"):
-                    datos_transferencia = st.secrets.get("datos_transferencia")
-                    if datos_transferencia:
-                        mensaje_transferencia = mod_pedidos.generar_mensaje_datos_transferencia_whatsapp(
-                            datos_transferencia["nombre"],
-                            datos_transferencia["rut"],
-                            datos_transferencia["tipo_cuenta"],
-                            datos_transferencia["numero_cuenta"],
-                            datos_transferencia["email"],
-                        )
-                        mensaje_whatsapp(mensaje_transferencia, pedido["cliente_telefono"])
-                    else:
-                        st.warning(
-                            "Configura tus datos de transferencia en .streamlit/secrets.toml "
-                            "(sección [datos_transferencia]) para que aparezcan aquí."
-                        )
-
-                with st.form("form_cobrar_pedido"):
-                    medio = st.selectbox("Medio de pago", mod_caja.MEDIOS_VALIDOS)
-                    enviado = st.form_submit_button("Marcar entregado y cobrado")
-                if enviado:
-                    try:
-                        resultado = mod_pedidos.entregar_y_cobrar(pedido_id, medio)
-                        mensaje = (
-                            f"Pedido entregado y cobrado. Ingreso "
-                            f"#{resultado['movimiento_ingreso_id']} registrado en Caja."
-                        )
-                        if resultado["comision"] > 0:
-                            mensaje += (
-                                f" Se registró además un gasto de ${resultado['comision']:.2f} "
-                                f"por comisión de {medio} (#{resultado['movimiento_gasto_comision_id']})."
-                            )
-                        st.success(mensaje)
-                    except Exception as e:
-                        mostrar_error(e)
-                    else:
-                        if mod_whatsapp.api_configurada():
-                            try:
-                                mod_whatsapp.enviar_pedido_pagado(pedido_id, medio)
-                                st.success("Avisado por WhatsApp.")
-                            except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                                mostrar_aviso_whatsapp(e)
-                        st.rerun()
-
+            if not pedido["pagado"] and pedido["estado"] != "cancelado" and pedido["items"]:
                 st.divider()
+                _bloque_registrar_pago(pedido_id, pedido)
+
+            if abierto:
+                st.divider()
+                if pedido["pagado"]:
+                    st.caption(
+                        "⚠ Este pedido ya está pagado: si lo cancelas, el ingreso sigue en Caja "
+                        "(registra ahí la devolución si corresponde)."
+                    )
                 if st.button("Cancelar pedido", type="secondary"):
                     try:
                         mod_pedidos.cancelar_pedido(pedido_id)
-                        st.success("Pedido cancelado.")
+                        st.toast("Pedido cancelado.")
                         st.rerun()
                     except Exception as e:
                         mostrar_error(e)
@@ -1461,7 +1730,7 @@ def seccion_dashboard():
 
         st.subheader("Pedidos por estado")
         df_estado = pd.DataFrame(
-            [{"estado": e, "cantidad": c} for e, c in ped["por_estado"].items()]
+            [{"estado": mod_pedidos.etiqueta_estado(e), "cantidad": c} for e, c in ped["por_estado"].items()]
         ).set_index("estado")
         st.bar_chart(df_estado["cantidad"])
 

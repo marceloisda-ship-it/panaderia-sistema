@@ -274,7 +274,7 @@ def enviar_recordatorio_pago(pedido_id: int) -> dict:
 
 
 def enviar_pedido_pagado(pedido_id: int, medio_pago: str) -> dict:
-    """Confirma al cliente que su pedido quedó pagado y entregado."""
+    """Confirma al cliente que su pago quedó registrado."""
     pedido = mod_pedidos.detalle_pedido(pedido_id)
     return _enviar_y_registrar(
         pedido_id, "pedido_pagado", pedido["cliente_telefono"],

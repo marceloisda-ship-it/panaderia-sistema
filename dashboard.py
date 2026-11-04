@@ -29,8 +29,7 @@ from datetime import date
 from db import conectar, cache_lectura
 import recetas as mod_rec
 import caja as mod_caja
-
-ESTADOS_PEDIDOS = ("pendiente", "confirmado", "entregado", "cancelado")
+from pedidos import ESTADOS_VALIDOS as ESTADOS_PEDIDOS
 
 
 def _rango_mes(anio: int, mes: int) -> tuple[str, str]:
@@ -97,7 +96,7 @@ def _resumen_pedidos(pedidos_mes: list[dict]) -> dict:
     total = len(pedidos_mes)
     por_estado = {estado: 0 for estado in ESTADOS_PEDIDOS}
     for p in pedidos_mes:
-        por_estado[p["estado"]] += 1
+        por_estado[p["estado"]] = por_estado.get(p["estado"], 0) + 1
 
     no_cancelados = [p for p in pedidos_mes if p["estado"] != "cancelado"]
     monto_no_cancelado = sum(p["total"] for p in no_cancelados)

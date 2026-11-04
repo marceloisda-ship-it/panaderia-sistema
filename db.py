@@ -263,13 +263,63 @@ def inicializar_db() -> None:
             id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE RESTRICT,
             fecha_entrega TEXT NOT NULL,
-            estado TEXT NOT NULL DEFAULT 'pendiente'
-                CHECK (estado IN ('pendiente', 'confirmado', 'entregado', 'cancelado')),
+            estado TEXT NOT NULL DEFAULT 'recibido'
+                CHECK (estado IN ('recibido', 'confirmado', 'en_produccion', 'listo', 'entregado', 'cancelado')),
             pagado BOOLEAN NOT NULL DEFAULT FALSE,
             medio_pago TEXT CHECK (medio_pago IN ('efectivo', 'debito', 'credito', 'transferencia')),
             notas TEXT,
-            fecha_creacion TEXT NOT NULL
+            fecha_creacion TEXT NOT NULL,
+            canal_origen TEXT CHECK (canal_origen IN ('whatsapp', 'presencial', 'instagram', 'otro')),
+            fecha_entregado TEXT,
+            fecha_pago TEXT
         );
+    """)
+
+    # Migración de bases creadas antes del flujo de estados completo
+    # (recibido → confirmado → en producción → listo → entregado), cuando
+    # solo existían pendiente/confirmado/entregado/cancelado y entregar y
+    # cobrar eran una sola acción. Es idempotente: las columnas usan
+    # IF NOT EXISTS y el cambio de CHECK solo corre si el CHECK vigente
+    # todavía no conoce 'recibido' (en una base ya migrada no hace nada).
+    sentencias.append("""
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS canal_origen TEXT
+            CHECK (canal_origen IN ('whatsapp', 'presencial', 'instagram', 'otro'));
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fecha_entregado TEXT;
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fecha_pago TEXT;
+    """)
+    sentencias.append("""
+        DO $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'pedidos'::regclass
+                  AND conname = 'pedidos_estado_check'
+                  AND position('recibido' in pg_get_constraintdef(oid)) > 0
+            ) THEN
+                -- Se borra el CHECK viejo de estado sin depender de su
+                -- nombre (cualquier CHECK de pedidos que mencione 'pendiente').
+                FOR r IN
+                    SELECT conname FROM pg_constraint
+                    WHERE conrelid = 'pedidos'::regclass AND contype = 'c'
+                      AND position('pendiente' in pg_get_constraintdef(oid)) > 0
+                LOOP
+                    EXECUTE 'ALTER TABLE pedidos DROP CONSTRAINT ' || quote_ident(r.conname);
+                END LOOP;
+                ALTER TABLE pedidos DROP CONSTRAINT IF EXISTS pedidos_estado_check;
+                UPDATE pedidos SET estado = 'recibido' WHERE estado = 'pendiente';
+                ALTER TABLE pedidos ALTER COLUMN estado SET DEFAULT 'recibido';
+                ALTER TABLE pedidos ADD CONSTRAINT pedidos_estado_check CHECK
+                    (estado IN ('recibido', 'confirmado', 'en_produccion', 'listo', 'entregado', 'cancelado'));
+                -- Los pedidos ya entregados/pagados no guardaban cuándo:
+                -- se usa la fecha de entrega como mejor aproximación.
+                UPDATE pedidos SET fecha_entregado = fecha_entrega
+                    WHERE estado = 'entregado' AND fecha_entregado IS NULL;
+                UPDATE pedidos SET fecha_pago = fecha_entrega
+                    WHERE pagado AND fecha_pago IS NULL;
+            END IF;
+        END $$;
     """)
 
     sentencias.append("""
@@ -281,6 +331,23 @@ def inicializar_db() -> None:
             precio_unitario REAL NOT NULL CHECK (precio_unitario >= 0),
             UNIQUE (pedido_id, receta_id)
         );
+    """)
+
+    # --- Módulo de Cobranza ---------------------------------------------------
+    # Fila única (id = 1): a los cuántos días desde la entrega se considera
+    # que corresponde recordarle el pago a un cliente que no ha pagado. No
+    # es un plazo de pago, solo el umbral del aviso (ver pedidos.py).
+
+    sentencias.append("""
+        CREATE TABLE IF NOT EXISTS configuracion_cobranza (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            dias_recordatorio INTEGER NOT NULL DEFAULT 3 CHECK (dias_recordatorio >= 0)
+        );
+    """)
+    sentencias.append("""
+        INSERT INTO configuracion_cobranza (id, dias_recordatorio)
+        VALUES (1, 3)
+        ON CONFLICT (id) DO NOTHING;
     """)
 
     # --- Módulo de WhatsApp (ver whatsapp.py) --------------------------------
