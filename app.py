@@ -122,7 +122,7 @@ def _es_por_cobrar(p: dict) -> bool:
     return p["estado"] == "entregado" and not p["pagado"]
 
 
-# Estados que se pueden elegir en el filtro de Agenda y Detalle, en el
+# Estados que se pueden elegir en el filtro de Agenda y Línea de producción, en el
 # orden del flujo. Los cancelados y los por cobrar no van aquí (los por
 # cobrar tienen su propia vista).
 _ESTADOS_FILTRO = ("recibido", "confirmado", "en_produccion", "listo", "entregado")
@@ -1063,17 +1063,20 @@ def _bloque_estado_pedido(pedido_id: int, pedido: dict):
     abre el formulario de entrega, que pide si pagó o no."""
     estado = pedido["estado"]
     abierto = estado in mod_pedidos.ESTADOS_ABIERTOS
-    clave_entrega = "entregar_pedido_id"
+    clave_entrega = "entregar_pedido_id"  # ids con el formulario de entrega abierto
 
     st.subheader("Avance del pedido")
     elegido = linea_tiempo_pedido(pedido, editable=abierto, key=f"linea_tiempo_{pedido_id}")
 
+    if not isinstance(st.session_state.get(clave_entrega), set):  # sesiones de la versión anterior
+        st.session_state[clave_entrega] = set()
+    entregas_abiertas = st.session_state[clave_entrega]
     if elegido == "entregado":
-        st.session_state[clave_entrega] = pedido_id
+        entregas_abiertas.add(pedido_id)
     elif elegido:
         try:
             mod_pedidos.actualizar_estado(pedido_id, elegido)
-            st.session_state.pop(clave_entrega, None)
+            entregas_abiertas.discard(pedido_id)
             st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(elegido)}.")
         except Exception as e:
             mostrar_error(e)
@@ -1083,11 +1086,11 @@ def _bloque_estado_pedido(pedido_id: int, pedido: dict):
     if not abierto:
         return
 
-    if st.session_state.get(clave_entrega) == pedido_id:
+    if pedido_id in entregas_abiertas:
         with st.container(border=True):
             _bloque_entregar_pedido(pedido_id, pedido)
-            if st.button("Cerrar", key="btn_cerrar_entrega"):
-                st.session_state.pop(clave_entrega, None)
+            if st.button("Cerrar", key=f"btn_cerrar_entrega_{pedido_id}"):
+                entregas_abiertas.discard(pedido_id)
                 st.rerun()
         return
 
@@ -1110,17 +1113,19 @@ def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
             "Si no, queda como **por cobrar** y el pago se registra después."
         )
 
-    with st.form("form_entregar_pedido"):
+    with st.form(f"form_entregar_pedido_{pedido_id}"):
         pago_al_recibir = False
         medio = None
         if not pedido["pagado"]:
             pago_al_recibir = st.radio(
                 "¿Pagó al recibir?", [False, True],
                 format_func=lambda v: "Sí, pagó al recibir" if v else "No, queda por cobrar",
-                horizontal=True,
+                horizontal=True, key=f"pago_al_recibir_{pedido_id}",
             )
-            medio = st.selectbox("Medio de pago (si pagó)", mod_caja.MEDIOS_VALIDOS)
-        fecha = st.date_input("Fecha de entrega", value=date.today(), max_value=date.today())
+            medio = st.selectbox("Medio de pago (si pagó)", mod_caja.MEDIOS_VALIDOS,
+                                 key=f"medio_entrega_{pedido_id}")
+        fecha = st.date_input("Fecha de entrega", value=date.today(), max_value=date.today(),
+                              key=f"fecha_entrega_real_{pedido_id}")
         enviado = st.form_submit_button("Marcar entregado")
     if enviado:
         try:
@@ -1135,7 +1140,9 @@ def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
                 _avisar_pago(pedido_id, medio, resultado)
             else:
                 st.toast(f"Pedido #{pedido_id} entregado.")
-            st.session_state.pop("entregar_pedido_id", None)
+            entregas = st.session_state.get("entregar_pedido_id")
+            if isinstance(entregas, set):
+                entregas.discard(pedido_id)
             st.rerun()
 
 
@@ -1243,6 +1250,130 @@ def _confirmar_quitar_item(pedido: dict, receta_id: int, nombre: str):
         st.rerun()
 
 
+def _detalle_pedido_completo(pedido_id: int):
+    """Toda la información de un pedido y sus acciones (avanzar en la
+    línea de tiempo, reagendar, entregar, pagar, cancelar, eliminar).
+    Todas las claves llevan el id para poder abrir varios pedidos a la vez."""
+    pedido = mod_pedidos.detalle_pedido(pedido_id)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Cliente", pedido["cliente_nombre"])
+    col2.metric("Fecha de entrega", pedido["fecha_entrega"])
+    col3.metric("Total", f"${pedido['total']:.2f}")
+    st.caption(_linea_estado_pago(pedido))
+    if pedido["notas"]:
+        st.caption(f"Notas: {pedido['notas']}")
+
+    if pedido["items"]:
+        st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
+    else:
+        st.info("Este pedido todavía no tiene ítems.")
+
+    abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
+
+    st.divider()
+    _bloque_estado_pedido(pedido_id, pedido)
+
+    if abierto:
+        st.divider()
+        st.markdown("**Reagendar**")
+        st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
+        with st.form(f"form_reagendar_pedido_{pedido_id}"):
+            nueva_fecha = st.date_input(
+                "Nueva fecha de entrega",
+                value=date.fromisoformat(pedido["fecha_entrega"]), key=f"nueva_fecha_{pedido_id}",
+            )
+            enviado = st.form_submit_button("Reagendar pedido")
+        if enviado:
+            try:
+                mod_pedidos.reagendar_pedido(pedido_id, nueva_fecha.isoformat())
+                st.toast(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
+
+    if not pedido["pagado"] and pedido["estado"] != "cancelado" and pedido["items"]:
+        st.divider()
+        _bloque_registrar_pago(pedido_id, pedido)
+
+    if abierto:
+        st.divider()
+        if pedido["pagado"]:
+            st.caption(
+                "⚠ Este pedido ya está pagado: si lo cancelas, el ingreso sigue en Caja "
+                "(registra ahí la devolución si corresponde)."
+            )
+        if st.button("Cancelar pedido", type="secondary", key=f"btn_cancelar_{pedido_id}"):
+            try:
+                mod_pedidos.cancelar_pedido(pedido_id)
+                st.toast("Pedido cancelado.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
+
+    st.divider()
+    st.markdown("**Eliminar pedido**")
+    st.caption(
+        "Para pedidos mal tomados o de prueba: borra el pedido y sus ítems por completo "
+        "(a diferencia de Cancelar, no queda registro). No se puede si ya fue cobrado."
+    )
+    if pedido["pagado"]:
+        st.warning(
+            "Este pedido ya fue cobrado y generó un ingreso en Flujo de caja. "
+            "Anula ese movimiento en Caja primero si de verdad quieres eliminarlo, "
+            "o usa 'Cancelar pedido' en su lugar."
+        )
+    else:
+        confirmar_eliminar = st.checkbox(
+            f"Confirmo que quiero eliminar el pedido #{pedido_id} definitivamente", key=f"chk_eliminar_{pedido_id}"
+        )
+        if st.button("Eliminar pedido", type="secondary", disabled=not confirmar_eliminar, key=f"btn_eliminar_{pedido_id}"):
+            try:
+                mod_pedidos.eliminar_pedido(pedido_id)
+                st.toast(f"Pedido #{pedido_id} eliminado.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
+
+
+_DIAS_ENTREGADOS_LINEA = 14
+
+
+def _vista_linea_produccion():
+    """Todos los pedidos, agrupados por etapa (Recibido → Entregado). Al
+    tocar uno se despliega su detalle completo para irlo avanzando."""
+    desde_entregados = (date.today() - timedelta(days=_DIAS_ENTREGADOS_LINEA)).isoformat()
+    pedidos = [
+        p for p in mod_pedidos.listar_pedidos()
+        if p["estado"] in _ESTADOS_FILTRO
+        and (p["estado"] != "entregado"
+             or (p.get("fecha_entregado") or p["fecha_entrega"]) >= desde_entregados)
+    ]
+    st.caption(
+        "Toca un pedido para ver todo su detalle y avanzarlo. Entregados: solo los de los "
+        f"últimos {_DIAS_ENTREGADOS_LINEA} días (el resto, en Agenda)."
+    )
+    iconos = {clave: emoji for clave, _, _, emoji in _ESTADOS_CALENDARIO}
+    for estado in _ESTADOS_FILTRO:
+        grupo = [p for p in pedidos if p["estado"] == estado]
+        st.markdown(f"#### {iconos[estado]} {mod_pedidos.etiqueta_estado(estado)} ({len(grupo)})")
+        if not grupo:
+            st.caption("Sin pedidos en esta etapa.")
+            continue
+        for p in grupo:
+            fecha = date.fromisoformat(p["fecha_entrega"]).strftime("%d-%m")
+            monto = f"${p['total']:,.0f}".replace(",", ".")
+            exp = st.expander(
+                f"#{p['id']} · {p['cliente_nombre']} · entrega {fecha} · {monto}{_marca_pago(p)}",
+                key=f"exp_pedido_{p['id']}", on_change="rerun",
+            )
+            # El detalle solo se arma para los pedidos abiertos (con 50+
+            # pedidos, dibujarlos todos haría lenta cada interacción).
+            if exp.open:
+                with exp:
+                    _detalle_pedido_completo(p["id"])
+
+
 def seccion_pedidos():
     st.header("📋 Pedidos")
     a_recordar = [p for p in mod_pedidos.listar_por_cobrar() if p["toca_recordar"]]
@@ -1254,9 +1385,11 @@ def seccion_pedidos():
     # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
     # pestañas en cada interacción, y contra Supabase eso son decenas de
     # consultas por click. Con este selector solo corre la sección activa.
+    if st.session_state.get("vista_pedidos") == "Detalle / Cobrar":  # nombre anterior
+        st.session_state["vista_pedidos"] = "Línea de producción"
     vista = st.radio(
         "Sección",
-        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Por cobrar",
+        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Línea de producción", "Por cobrar",
          "Capacidad de producción"],
         horizontal=True,
         label_visibility="collapsed",
@@ -1405,7 +1538,7 @@ def seccion_pedidos():
             try:
                 pedido_nuevo = mod_pedidos.detalle_pedido(pedido_nuevo_id)
             except ValueError:
-                # El pedido ya no existe (por ejemplo, se eliminó desde Detalle / Cobrar).
+                # El pedido ya no existe (por ejemplo, se eliminó desde Línea de producción).
                 del st.session_state["pedido_en_construccion"]
                 pedido_nuevo = None
 
@@ -1497,93 +1630,8 @@ def seccion_pedidos():
                 if col_btn.button("Quitar ítem", type="secondary"):
                     _confirmar_quitar_item(pedido, opciones_quitar[nombre_a_quitar], nombre_a_quitar)
 
-    elif vista == "Detalle / Cobrar":
-        opcion_filtro = st.selectbox(
-            "Filtrar por estado", _opciones_filtro_pedidos(), index=0, key="detalle_filtro_estado"
-        )
-        estado_filtro, filtro = _aplicar_filtro_pedidos(opcion_filtro)
-        pedido_id = selector_pedido("Pedido", "sel_pedido_detalle", estado=estado_filtro, filtro=filtro)
-        if pedido_id is not None:
-            pedido = mod_pedidos.detalle_pedido(pedido_id)
-
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Cliente", pedido["cliente_nombre"])
-            col2.metric("Fecha de entrega", pedido["fecha_entrega"])
-            col3.metric("Total", f"${pedido['total']:.2f}")
-            st.caption(_linea_estado_pago(pedido))
-            if pedido["notas"]:
-                st.caption(f"Notas: {pedido['notas']}")
-
-            if pedido["items"]:
-                st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
-            else:
-                st.info("Este pedido todavía no tiene ítems.")
-
-            abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
-
-            st.divider()
-            _bloque_estado_pedido(pedido_id, pedido)
-
-            if abierto:
-                st.divider()
-                st.subheader("Reagendar")
-                st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
-                with st.form("form_reagendar_pedido"):
-                    nueva_fecha = st.date_input(
-                        "Nueva fecha de entrega",
-                        value=date.fromisoformat(pedido["fecha_entrega"]),
-                    )
-                    enviado = st.form_submit_button("Reagendar pedido")
-                if enviado:
-                    try:
-                        mod_pedidos.reagendar_pedido(pedido_id, nueva_fecha.isoformat())
-                        st.toast(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
-
-            if not pedido["pagado"] and pedido["estado"] != "cancelado" and pedido["items"]:
-                st.divider()
-                _bloque_registrar_pago(pedido_id, pedido)
-
-            if abierto:
-                st.divider()
-                if pedido["pagado"]:
-                    st.caption(
-                        "⚠ Este pedido ya está pagado: si lo cancelas, el ingreso sigue en Caja "
-                        "(registra ahí la devolución si corresponde)."
-                    )
-                if st.button("Cancelar pedido", type="secondary"):
-                    try:
-                        mod_pedidos.cancelar_pedido(pedido_id)
-                        st.toast("Pedido cancelado.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
-
-            st.divider()
-            st.subheader("Eliminar pedido")
-            st.caption(
-                "Para pedidos mal tomados o de prueba: borra el pedido y sus ítems por completo "
-                "(a diferencia de Cancelar, no queda registro). No se puede si ya fue cobrado."
-            )
-            if pedido["pagado"]:
-                st.warning(
-                    "Este pedido ya fue cobrado y generó un ingreso en Flujo de caja. "
-                    "Anula ese movimiento en Caja primero si de verdad quieres eliminarlo, "
-                    "o usa 'Cancelar pedido' en su lugar."
-                )
-            else:
-                confirmar_eliminar = st.checkbox(
-                    f"Confirmo que quiero eliminar el pedido #{pedido_id} definitivamente"
-                )
-                if st.button("Eliminar pedido", type="secondary", disabled=not confirmar_eliminar):
-                    try:
-                        mod_pedidos.eliminar_pedido(pedido_id)
-                        st.success(f"Pedido #{pedido_id} eliminado.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
+    elif vista == "Línea de producción":
+        _vista_linea_produccion()
 
     elif vista == "Capacidad de producción":
         config = mod_prod.obtener_configuracion()
