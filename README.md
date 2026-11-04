@@ -6,7 +6,15 @@ flujo de caja, pedidos y clientes.
 **Estado actual**: los módulos de **Costeo** (ingredientes y recetas),
 **Flujo de caja**, **Costos indirectos**, **Pedidos**, **Clientes** y
 **Dashboard** ya están funcionando, con una interfaz visual (Streamlit)
-para usarlos día a día.
+para usarlos día a día. Las Etapas 1 y 2 de la hoja de ruta (flujo de
+estados y cobranza) están terminadas; ver **Bitácora de cambios** al
+final para el detalle de la última sesión.
+
+**Dónde corre**: la versión en uso vive en la nube — base de datos en
+**Supabase** (Postgres, región São Paulo) y app en **Streamlit Community
+Cloud**, que despliega la rama `migracion-nube` (no `main`). Cada push a
+esa rama actualiza la app. Las secciones de abajo sobre `panaderia.db`
+(SQLite) y `main.py` describen la versión local original.
 
 ## Cómo ejecutarlo
 
@@ -129,31 +137,65 @@ fijo relevante. Si eso cambia, se puede ampliar el mismo mecanismo.
 
 ## Cómo funcionan los pedidos
 
-1. Creas un **pedido** eligiendo un **cliente** ya registrado, o
-   creando uno nuevo ahí mismo sin salir de la pantalla (ver Clientes
-   más abajo), y la **fecha de entrega**.
-2. Le agregas **ítems**: una o varias recetas, cada una con su cantidad.
-   El precio de cada ítem queda "congelado" al momento de agregarlo, así
-   que si después cambias el precio de venta de la receta, los pedidos
-   ya tomados no se alteran.
-3. Al agregar un ítem, el sistema avisa (sin bloquear) si eso sobrepasa
-   tu **capacidad de producción** para ese día — ver punto 5.
-4. Cuando entregas el pedido y el cliente paga, marcas **"Entregar y
-   cobrar"** con el medio de pago: el sistema genera automáticamente el
-   ingreso correspondiente en **Flujo de caja**, sin que tengas que
-   registrarlo dos veces.
-5. La **capacidad de producción diaria** se mide en tiempo, no en
-   unidades: defines cuántas horas al día dedicas a producir, y el
-   sistema usa el tiempo de preparación por lote que ya cargaste en cada
-   receta (mano de obra, ver Costos indirectos) para saber cuánto de esa
-   capacidad ya está comprometida en pedidos de un día dado.
-6. La pestaña **Planificación** te da la vista para organizarte: un
-   **calendario del mes** con los pedidos de cada día (chips de color por
-   estado: pendiente, confirmado, entregado; borde rojo si el día está
-   sobrevendido), un resumen del mes con **tiempo requerido, disponible
-   y restante** (de hoy en adelante), y al elegir un día puntual, el
-   desglose de **qué panes preparar** (agregado entre todos los pedidos
-   de ese día) y el detalle de cada pedido con su cliente.
+Cada pedido avanza por estos estados (el flujo completo está en **Flujo
+ideal de un pedido**, más abajo):
+
+`recibido` → `confirmado` → `en producción` → `listo` → `entregado`
+(cualquiera de los cuatro primeros puede pasar a `cancelado`)
+
+El **pago va aparte del estado**: un pedido puede estar entregado y
+todavía sin pagar (queda **por cobrar**), o pagado por adelantado antes
+de entregarse.
+
+La sección **Pedidos** tiene estas pestañas:
+
+1. **Planificación**: **calendario del mes** con los pedidos de cada día
+   (un chip de color por estado: 🟡 recibido, 🔵 confirmado, 🟠 en
+   producción, 🟣 listo, 🟢 entregado; borde rojo si el día está
+   sobrevendido), resumen del mes por estado y cuántos entregados siguen
+   sin pagar, **tiempo requerido, disponible y restante** (de hoy en
+   adelante), y el detalle de un día: **qué panes preparar** y cada pedido.
+2. **Agenda**: pedidos agrupados por fecha de entrega, con filtro de
+   fechas y de estado (Recibido, Confirmado, En producción, Listo,
+   Entregado — en ese orden; sin cancelados ni "por cobrar"). También
+   permite **reagendar de una vez todos los pedidos de un día**.
+3. **Crear pedido**: elegir un **cliente** existente o crearlo ahí
+   mismo, la **fecha de entrega** y **por dónde llegó** el pedido
+   (WhatsApp, presencial, Instagram u otro). El pedido nace `recibido` y
+   se le agregan ítems en la misma pantalla.
+4. **Agregar ítems**: solo lista pedidos `recibido` y `confirmado`. Orden
+   de la pantalla: ítems actuales (tabla y total) → ítem para agregar →
+   cantidad → ítem para quitar (pide **confirmación** antes de quitar).
+   El precio de cada ítem queda "congelado" al agregarlo. Si un ítem
+   sobrepasa la capacidad del día, avisa sin bloquear.
+5. **Línea de producción** (antes "Detalle / Cobrar"): todos los pedidos
+   agrupados por etapa (Recibido → Entregado; de los entregados, solo los
+   de los últimos 14 días; los cancelados no aparecen). Al tocar un
+   pedido se despliega todo: datos, ítems, **línea de tiempo** del estado,
+   reagendar, registrar pago, cancelar y eliminar.
+   - **Línea de tiempo**: muestra los 5 pasos (hechos con ✓, el actual
+     destacado, los que faltan en gris). Tocar un paso mueve el pedido a
+     ese estado, también hacia atrás para corregir. Tocar **Entregado**
+     abre el formulario de entrega: "¿Pagó al recibir?" + medio de pago +
+     fecha. Si pagó, se registra el ingreso en Caja en el mismo paso; si
+     no, queda por cobrar.
+6. **Por cobrar**: entregados sin pagar, del más antiguo al más reciente,
+   con los días desde la entrega y el monto adeudado; 🔔 marca los que ya
+   pasaron los **días de aviso** (configurables ahí mismo, por defecto 3;
+   no es un plazo de pago). Cada uno trae el formulario para registrar el
+   pago. Al entrar a Pedidos aparece un aviso si hay cobros que ya toca
+   recordar.
+7. **Capacidad de producción**: la capacidad diaria se mide en tiempo, no
+   en unidades: defines cuántas horas al día dedicas a producir, y el
+   sistema usa el tiempo de preparación por lote de cada receta (mano de
+   obra, ver Costos indirectos) para saber cuánto ya está comprometido.
+
+**Pago y Caja**: al registrar un pago (al entregar o después) se genera
+automáticamente el **ingreso** en Flujo de caja y, si fue con débito o
+crédito, un **gasto por la comisión** del medio de pago. Todo va en una
+sola transacción: nunca queda un pedido pagado sin su ingreso. Un pedido
+pagado no se puede pagar dos veces ni eliminar (hay que anular antes el
+ingreso en Caja).
 
 ## Cómo funcionan los clientes
 
@@ -266,7 +308,25 @@ La base de todo lo demás: que el sistema refleje el flujo ideal.
 - [x] Configurar **a los cuántos días** se considera que corresponde
       recordar el pago (sin plazo fijo de pago, solo el aviso).
 - [x] Reutilizar el mensaje de recordatorio de pago que ya existe
-      (detalle del pedido y medios de pago).
+      (detalle del pedido y medios de pago). *Nota (2026-11-04): el
+      mensaje se construyó, pero después se sacaron de la interfaz todos
+      los mensajes de WhatsApp porque no se estaban usando. El texto
+      sigue en `pedidos.generar_recordatorio_pago_whatsapp` para la
+      Etapa 5.*
+
+### Preguntas abiertas antes de las Etapas 3 y 4
+
+Quedaron planteadas y **sin respuesta todavía**; hay que resolverlas al
+retomar:
+
+- **Etapa 3**: ¿cada receta ocupa una panificadora durante todo su ciclo
+  (o sea, capacidad = 3 tandas en paralelo durante las horas del día), o
+  las máquinas son distintas entre sí (programas, tamaños)?
+- **Etapa 4**: ¿el stock incluye insumos (bolsas, etiquetas, cajas)? ¿Cómo
+  se ingresan las compras (ej. un saco de 25 kg convertido a gramos)?
+- Etapa 3 ya tiene una base: la **Línea de producción** (ver Cómo
+  funcionan los pedidos) permite pasar pedidos a `en producción` y
+  `listo`; falta la asignación por máquina y el nuevo modelo de capacidad.
 
 ### Etapa 3 — Producción con 3 panificadoras
 
@@ -338,9 +398,11 @@ que hay que resolver antes:
   1. *(ya en curso)* Solo la app nativa de WhatsApp Business — catálogo
      de productos replicado a mano, mensajes rápidos, mensaje de
      ausencia. Los pedidos se siguen registrando a mano en el sistema.
-  2. Botón en Pedidos → Detalle/Cobrar que genere un texto-resumen del
-     pedido (ítems, total, fecha de entrega) listo para copiar y pegar
-     en WhatsApp — sin APIs externas, mejora chica dentro del sistema.
+  2. Textos listos para copiar y pegar en WhatsApp (resumen, pedido
+     listo, cobro, recordatorio, datos de transferencia) con botón
+     "Abrir en WhatsApp". *Se construyó y se retiró de la interfaz el
+     2026-11-04 porque no se usaba; el código sigue en `pedidos.py` y
+     `whatsapp.py`.*
   3. Integración real vía WhatsApp Business Platform (Meta Cloud API):
      mensajes y creación de pedidos automáticos. Implica alojar el
      sistema en un servidor con acceso a internet (la versión nube ya
@@ -349,3 +411,101 @@ que hay que resolver antes:
   4. Automatización avanzada: catálogo interactivo en el chat,
      respuestas automáticas, pagos con link que se registran solos en
      Caja.
+
+## Bitácora de cambios
+
+Registro de lo hecho en cada sesión, para retomar sin perder contexto.
+
+### 2026-11-04 — Etapas 1 y 2, y rediseño de Pedidos
+
+**Lo que se construyó** (todo desplegado en `migracion-nube`):
+
+1. **Flujo de estados** (Etapa 1): `recibido`, `confirmado`,
+   `en_produccion`, `listo`, `entregado`, `cancelado`. En código las
+   claves van sin tilde ni espacio (`en_produccion`); en pantalla se usan
+   las etiquetas de `pedidos.ETIQUETAS_ESTADO`. `pedidos.SIGUIENTE_ESTADO`
+   define el paso natural siguiente y `ESTADOS_ABIERTOS` los que aún se
+   pueden editar, reagendar o cancelar.
+2. **Canal de origen** al crear el pedido (`pedidos.CANALES_VALIDOS`).
+3. **Entrega y pago separados**: `marcar_entregado()`, `registrar_pago()`
+   (también sirve para pago por adelantado) y `entregar_y_cobrar()` como
+   atajo que hace ambas cosas en una sola transacción.
+   `actualizar_estado()` no acepta `entregado` (obliga a pasar por la
+   entrega, que guarda la fecha) y permite volver atrás entre estados
+   abiertos.
+4. **Cobranza** (Etapa 2): vista Por cobrar, `listar_por_cobrar()`,
+   tabla `configuracion_cobranza` (días de aviso, por defecto 3) y aviso
+   al entrar a Pedidos.
+5. **Interfaz de Pedidos rediseñada**, a pedido del usuario:
+   - "Detalle / Cobrar" pasó a ser **Línea de producción** (pedidos
+     agrupados por etapa, se despliegan al tocarlos).
+   - **Línea de tiempo clickeable** para cambiar el estado (componente
+     propio, ver notas técnicas). Reemplazó al botón "avanzar" y al
+     "Corregir estado".
+   - Filtro de estado solo con los 5 pasos en orden del flujo (se
+     quitaron "(todos)", "Abiertos (sin entregar)", "Cancelado" y "Por
+     cobrar": el usuario no los encontraba claros).
+   - Agregar ítems: solo pedidos recibidos/confirmados, nuevo orden de
+     pantalla y confirmación antes de quitar un ítem.
+   - **Se retiraron de la interfaz todos los mensajes de WhatsApp**
+     (resúmenes, recordatorios, datos de transferencia, botones wa.me,
+     envíos automáticos e historial) porque no se usaban. Las funciones
+     siguen en `pedidos.py` (`generar_*_whatsapp`) y `whatsapp.py`.
+
+**Base de datos (Supabase)**:
+
+- Columnas nuevas en `pedidos`: `canal_origen`, `fecha_entregado`,
+  `fecha_pago`. Tabla nueva `configuracion_cobranza`.
+- El CHECK `pedidos_estado_check` ahora acepta los 6 estados nuevos; el
+  valor por defecto es `recibido`.
+- Migración aplicada el 2026-11-04: no había pedidos `pendiente`; los 47
+  entregados (todos pagados) recibieron `fecha_entregado` y `fecha_pago`
+  = su `fecha_entrega` como aproximación. En ese momento: 54 pedidos
+  (5 confirmados, 47 entregados, 2 cancelados) y 0 por cobrar.
+- **Respaldo** previo en
+  `La PanaderIA/respaldos_supabase/2026-11-04_1856/` (fuera del repo:
+  contiene datos de clientes). Para repetirlo: `respaldo_supabase.py` en
+  esa carpeta (ver notas técnicas).
+
+**Commits del día**: `579b9f4`, `8dacbc9`, `b2d7f49`, `2e3a9e6`,
+`e59d0b8`, `6464a78`, `4b7c908`, `cfdefc3`, `1f31c61`.
+
+**Pendiente de verificar en la app** (no se pudo probar en el PC de
+desarrollo, ver notas técnicas): cómo se ve la línea de tiempo en el
+celular, los clics de la línea de tiempo y el diálogo de confirmación al
+quitar un ítem.
+
+**Siguiente paso**: responder las **Preguntas abiertas antes de las
+Etapas 3 y 4** (sección Pasos a seguir) y seguir con la Etapa 3.
+
+### Notas técnicas para retomar
+
+- **Cambios de esquema**: `db.inicializar_db()` crea las tablas y aplica
+  migraciones idempotentes. Al cambiar el esquema **hay que subir
+  `VERSION_ESQUEMA` en `db.py`**: Streamlit Cloud, al recibir un push,
+  recarga el código sin reiniciar el proceso y conserva el
+  `st.cache_resource`, así que sin subir la versión la migración no corre
+  (pasó el 2026-11-04: la app falló con `UndefinedColumn
+  fecha_entregado` y hubo que aplicar la migración a mano).
+- **Antes de migrar**: respaldar y ensayar el SQL contra Supabase dentro
+  de `BEGIN … ROLLBACK`.
+- **PC de desarrollo**: el Control de aplicaciones de Windows bloquea las
+  DLL de `psycopg2` y `pandas`, así que la app **no corre localmente**
+  (ni con `streamlit run` ni con `AppTest`). Para revisar el código se
+  usa `py -m pyflakes` y pruebas con módulos simulados; la prueba real es
+  en Streamlit Cloud. Para conectarse a Supabase desde el PC se usa
+  `pg8000` (Python puro) verificando TLS con la CA raíz de Supabase
+  (`prod-ca-2021.crt`).
+- **Línea de tiempo**: `linea_tiempo_pedido()` en `app.py`, hecha con
+  `st.components.v2.component` (HTML/CSS/JS en línea). Al tocar un paso,
+  el JS envía la clave del estado con `setTriggerValue("elegido", …)`.
+  Los formularios de entrega abiertos se guardan en
+  `st.session_state["entregar_pedido_id"]` (un conjunto de ids).
+- **Línea de producción**: cada pedido es un `st.expander` con
+  `key=f"exp_pedido_{id}"` y `on_change="rerun"`; el detalle solo se arma
+  si `exp.open`, para no hacer lenta la pantalla. Todas las claves de
+  widgets del detalle llevan el id del pedido (se pueden abrir varios).
+- **Git en este PC**: si git dice "gitfile does not point to a valid
+  repository", es porque cambió el nombre de la carpeta de usuario de
+  Windows; hay que reescribir las rutas en `.git` de este worktree y en
+  `../panaderia_sistema/.git/worktrees/panaderia_sistema-nube/gitdir`.
