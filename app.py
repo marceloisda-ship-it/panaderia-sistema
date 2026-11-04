@@ -1224,6 +1224,25 @@ def _vista_por_cobrar():
             _form_registrar_pago(p["id"], "por_cobrar")
 
 
+@st.dialog("¿Quitar este ítem?")
+def _confirmar_quitar_item(pedido: dict, receta_id: int, nombre: str):
+    item = next(i for i in pedido["items"] if i["receta_id"] == receta_id)
+    st.write(
+        f"Vas a quitar **{item['cantidad']} x {nombre}** del pedido "
+        f"**#{pedido['id']}** de **{pedido['cliente_nombre']}**."
+    )
+    col_si, col_no = st.columns(2)
+    if col_si.button("Sí, quitar", type="primary", width="stretch"):
+        try:
+            mod_pedidos.quitar_item_pedido(pedido["id"], receta_id)
+            st.toast(f"'{nombre}' quitado del pedido #{pedido['id']}.")
+            st.rerun()
+        except Exception as e:
+            mostrar_error(e)
+    if col_no.button("Cancelar", width="stretch"):
+        st.rerun()
+
+
 def seccion_pedidos():
     st.header("📋 Pedidos")
     a_recordar = [p for p in mod_pedidos.listar_por_cobrar() if p["toca_recordar"]]
@@ -1476,12 +1495,7 @@ def seccion_pedidos():
                     "Ítem para quitar", list(opciones_quitar.keys()), key="sel_quitar_item_pedido"
                 )
                 if col_btn.button("Quitar ítem", type="secondary"):
-                    try:
-                        mod_pedidos.quitar_item_pedido(pedido_id, opciones_quitar[nombre_a_quitar])
-                        st.toast(f"'{nombre_a_quitar}' quitado del pedido.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
+                    _confirmar_quitar_item(pedido, opciones_quitar[nombre_a_quitar], nombre_a_quitar)
 
     elif vista == "Detalle / Cobrar":
         opcion_filtro = st.selectbox(
