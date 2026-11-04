@@ -25,7 +25,6 @@ import produccion as mod_prod
 import pedidos as mod_pedidos
 import clientes as mod_clientes
 import dashboard as mod_dash
-import whatsapp as mod_whatsapp
 
 st.set_page_config(page_title="Panadería · Gestión", page_icon="🥖", layout="wide")
 
@@ -57,26 +56,6 @@ _inicializar_db_una_vez(VERSION_ESQUEMA)
 
 def mostrar_error(e: Exception):
     st.error(f"Error: {e}")
-
-
-def mostrar_aviso_whatsapp(e: Exception):
-    """Para cuando falla el envío de un WhatsApp que acompaña a una
-    acción que YA tuvo éxito (confirmar, cobrar): se avisa como
-    advertencia, no como error, porque el pedido sí quedó bien — solo
-    no le llegó el mensaje al cliente."""
-    st.warning(f"El pedido se guardó bien, pero no se pudo avisar por WhatsApp: {e}")
-
-
-def mensaje_whatsapp(texto: str, telefono: str | None, etiqueta: str = "💬 Abrir en WhatsApp"):
-    """Muestra un mensaje listo para copiar y, si el cliente tiene un
-    celular válido, un botón que abre su chat de WhatsApp con el texto ya
-    escrito (enlace wa.me: se manda a mano desde el WhatsApp del negocio)."""
-    st.code(texto, language=None)
-    enlace = mod_whatsapp.enlace_chat(telefono, texto)
-    if enlace:
-        st.link_button(etiqueta, enlace)
-    else:
-        st.caption("Para abrirlo directo en WhatsApp, registra un celular válido del cliente en Clientes.")
 
 
 def selector_ingrediente(label: str, key: str):
@@ -946,6 +925,119 @@ _TEXTO_AVANZAR = {
 }
 
 
+# --- Línea de tiempo del pedido (componente v2: HTML/CSS/JS propio) --------
+# Cada paso es un botón; al tocarlo, el JS manda la clave del estado elegido
+# a Python como "trigger" (dura un solo rerun) y Python cambia el estado.
+
+_CSS_LINEA_TIEMPO = """
+.lt { font-family: var(--st-font); color: var(--st-text-color); padding: 4px 0 2px; }
+.lt-pasos { display: grid; grid-template-columns: repeat(var(--n), 1fr); position: relative; }
+.lt-paso { display: flex; flex-direction: column; align-items: center; position: relative;
+  background: none; border: none; padding: 0 2px; font: inherit; color: inherit; cursor: default; }
+.lt-paso.clic { cursor: pointer; }
+.lt-paso::before { content: ""; position: absolute; top: 17px; right: 50%; width: 100%; height: 4px;
+  background: var(--st-border-color, rgba(128,128,128,.35)); z-index: 0; }
+.lt-paso:first-child::before { display: none; }
+.lt-paso.hecho::before, .lt-paso.actual::before { background: var(--c); }
+.lt-nodo { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 15px; z-index: 1; position: relative;
+  border: 3px solid var(--st-border-color, rgba(128,128,128,.45));
+  background: var(--st-background-color); color: var(--st-gray-text-color, #888);
+  transition: transform .12s ease, box-shadow .12s ease; }
+.lt-paso.hecho .lt-nodo { background: var(--c); border-color: var(--c); color: #fff; }
+.lt-paso.actual .lt-nodo { background: var(--c); border-color: var(--c); color: #fff;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--c) 28%, transparent); transform: scale(1.12); }
+.lt-paso.clic:hover .lt-nodo, .lt-paso.clic:focus-visible .lt-nodo { transform: scale(1.15);
+  border-color: var(--c); }
+.lt-paso:focus-visible { outline: none; }
+.lt-paso:focus-visible .lt-etq { text-decoration: underline; }
+.lt-etq { margin-top: 8px; font-size: .78rem; line-height: 1.15; text-align: center; opacity: .75; }
+.lt-paso.actual .lt-etq { font-weight: 700; opacity: 1; }
+.lt-paso.hecho .lt-etq { opacity: .95; }
+.lt-aviso { margin-top: 10px; font-size: .8rem; color: var(--st-red-text-color, #d83a3a); text-align: center; }
+.lt.cancelado .lt-pasos { opacity: .45; filter: grayscale(1); }
+@media (max-width: 480px) { .lt-nodo { width: 26px; height: 26px; font-size: 12px; }
+  .lt-paso::before { top: 14px; } .lt-etq { font-size: .66rem; } }
+"""
+
+_JS_LINEA_TIEMPO = """
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component
+  const root = parentElement.querySelector("#lt")
+  if (!root || !data) return
+  const pasos = data.pasos || []
+  const iActual = pasos.findIndex((p) => p.clave === data.actual)
+  root.className = "lt" + (data.cancelado ? " cancelado" : "")
+  root.innerHTML = ""
+  const fila = document.createElement("div")
+  fila.className = "lt-pasos"
+  fila.style.setProperty("--n", String(pasos.length))
+  pasos.forEach((p, i) => {
+    const b = document.createElement("button")
+    b.type = "button"
+    let clase = "lt-paso"
+    if (!data.cancelado && iActual >= 0) {
+      if (i < iActual) clase += " hecho"
+      else if (i === iActual) clase += " actual"
+    }
+    const clickeable = data.editable && i !== iActual
+    if (clickeable) clase += " clic"
+    b.className = clase
+    b.style.setProperty("--c", p.color)
+    b.disabled = !clickeable
+    b.title = clickeable ? "Mover el pedido a: " + p.etiqueta : p.etiqueta
+    const nodo = document.createElement("span")
+    nodo.className = "lt-nodo"
+    nodo.textContent = (!data.cancelado && i < iActual) ? "✓" : p.emoji
+    const etq = document.createElement("span")
+    etq.className = "lt-etq"
+    etq.textContent = p.etiqueta
+    b.append(nodo, etq)
+    if (clickeable) b.onclick = () => setTriggerValue("elegido", p.clave)
+    fila.appendChild(b)
+  })
+  root.appendChild(fila)
+  if (data.cancelado) {
+    const aviso = document.createElement("div")
+    aviso.className = "lt-aviso"
+    aviso.textContent = "✖ Pedido cancelado"
+    root.appendChild(aviso)
+  }
+}
+"""
+
+_LINEA_TIEMPO = st.components.v2.component(
+    "linea_tiempo_pedido",
+    html='<div id="lt" class="lt"></div>',
+    css=_CSS_LINEA_TIEMPO,
+    js=_JS_LINEA_TIEMPO,
+)
+
+_ICONOS_PASO = {"recibido": "📥", "confirmado": "✅", "en_produccion": "🔥", "listo": "🥖", "entregado": "📦"}
+
+
+def linea_tiempo_pedido(pedido: dict, editable: bool, key: str) -> str | None:
+    """Dibuja la línea de tiempo del pedido. Retorna la clave del estado
+    que se tocó en este rerun (o None)."""
+    colores = {clave: color for clave, _, color, _ in _ESTADOS_CALENDARIO}
+    resultado = _LINEA_TIEMPO(
+        data={
+            "pasos": [
+                {"clave": e, "etiqueta": mod_pedidos.etiqueta_estado(e),
+                 "color": colores[e], "emoji": _ICONOS_PASO[e]}
+                for e in _PASOS_FLUJO
+            ],
+            "actual": pedido["estado"],
+            "cancelado": pedido["estado"] == "cancelado",
+            "editable": editable,
+        },
+        key=key,
+        on_elegido_change=lambda: None,
+    )
+    return resultado.elegido
+
+
+
 def _linea_estado_pago(pedido: dict) -> str:
     partes = [f"Estado: {mod_pedidos.etiqueta_estado(pedido['estado'])}"]
     if pedido["pagado"]:
@@ -962,28 +1054,8 @@ def _linea_estado_pago(pedido: dict) -> str:
     return " · ".join(partes)
 
 
-def _expander_datos_transferencia(telefono: str | None):
-    with st.expander("Si el cliente va a transferir: datos para copiar"):
-        datos_transferencia = st.secrets.get("datos_transferencia")
-        if datos_transferencia:
-            mensaje_transferencia = mod_pedidos.generar_mensaje_datos_transferencia_whatsapp(
-                datos_transferencia["nombre"],
-                datos_transferencia["rut"],
-                datos_transferencia["tipo_cuenta"],
-                datos_transferencia["numero_cuenta"],
-                datos_transferencia["email"],
-            )
-            mensaje_whatsapp(mensaje_transferencia, telefono)
-        else:
-            st.warning(
-                "Configura tus datos de transferencia en .streamlit/secrets.toml "
-                "(sección [datos_transferencia]) para que aparezcan aquí."
-            )
-
-
 def _avisar_pago(pedido_id: int, medio: str, resultado: dict):
-    """Mensaje de éxito tras registrar un pago (con la comisión, si hubo)
-    y aviso automático por WhatsApp si la API está configurada."""
+    """Mensaje de éxito tras registrar un pago (con la comisión, si hubo)."""
     mensaje = f"Pago registrado. Ingreso #{resultado['movimiento_ingreso_id']} en Caja."
     if resultado["comision"] > 0:
         mensaje += (
@@ -991,61 +1063,48 @@ def _avisar_pago(pedido_id: int, medio: str, resultado: dict):
             f"(#{resultado['movimiento_gasto_comision_id']})."
         )
     st.toast(mensaje)
-    if mod_whatsapp.api_configurada():
-        try:
-            mod_whatsapp.enviar_pedido_pagado(pedido_id, medio)
-            st.toast("Avisado por WhatsApp.")
-        except mod_whatsapp.ErrorEnvioWhatsapp as e:
-            mostrar_aviso_whatsapp(e)
 
 
 def _bloque_estado_pedido(pedido_id: int, pedido: dict):
-    """Muestra en qué paso del flujo va el pedido y el botón para pasar
-    al siguiente (recibido → confirmado → en producción → listo)."""
+    """Línea de tiempo del pedido. Si está abierto, tocar un paso lo mueve
+    a ese estado (también hacia atrás, para corregir); tocar "Entregado"
+    abre el formulario de entrega, que pide si pagó o no."""
     estado = pedido["estado"]
+    abierto = estado in mod_pedidos.ESTADOS_ABIERTOS
+    clave_entrega = "entregar_pedido_id"
+
     st.subheader("Avance del pedido")
-    st.markdown(" → ".join(
-        f"**{mod_pedidos.etiqueta_estado(e)}**" if e == estado else mod_pedidos.etiqueta_estado(e)
-        for e in _PASOS_FLUJO
-    ))
+    elegido = linea_tiempo_pedido(pedido, editable=abierto, key=f"linea_tiempo_{pedido_id}")
+
+    if elegido == "entregado":
+        st.session_state[clave_entrega] = pedido_id
+    elif elegido:
+        try:
+            mod_pedidos.actualizar_estado(pedido_id, elegido)
+            st.session_state.pop(clave_entrega, None)
+            st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(elegido)}.")
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            st.rerun()
+
+    if not abierto:
+        return
+
+    if st.session_state.get(clave_entrega) == pedido_id:
+        with st.container(border=True):
+            _bloque_entregar_pedido(pedido_id, pedido)
+            if st.button("Cerrar", key="btn_cerrar_entrega"):
+                st.session_state.pop(clave_entrega, None)
+                st.rerun()
+        return
 
     siguiente = mod_pedidos.SIGUIENTE_ESTADO[estado]
     if siguiente in _TEXTO_AVANZAR:
         boton, ayuda = _TEXTO_AVANZAR[siguiente]
-        st.caption(ayuda)
-        if st.button(boton, type="primary", key="btn_avanzar_estado"):
-            try:
-                mod_pedidos.actualizar_estado(pedido_id, siguiente)
-                st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(siguiente)}.")
-            except Exception as e:
-                mostrar_error(e)
-            else:
-                if siguiente == "confirmado" and mod_whatsapp.api_configurada():
-                    try:
-                        mod_whatsapp.enviar_pedido_confirmado(pedido_id)
-                        st.toast("Avisado por WhatsApp.")
-                    except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                        mostrar_aviso_whatsapp(e)
-                st.rerun()
+        st.caption(f"Toca un paso para mover el pedido. Siguiente: **{boton}** — {ayuda}")
     else:
-        st.caption("Ya está listo: avísale al cliente y márcalo como entregado más abajo.")
-
-    if estado == "listo" and pedido["items"]:
-        st.caption("Mensaje para avisar que el pedido está listo:")
-        mensaje_whatsapp(mod_pedidos.generar_mensaje_listo_whatsapp(pedido_id), pedido["cliente_telefono"])
-
-    with st.expander("Corregir estado"):
-        st.caption("Para deshacer un paso marcado por error, o saltarse alguno.")
-        opciones = [e for e in mod_pedidos.ESTADOS_ABIERTOS if e != estado]
-        nuevo = st.selectbox("Mover a", opciones, format_func=mod_pedidos.etiqueta_estado,
-                             key="sel_corregir_estado")
-        if st.button("Cambiar estado", key="btn_corregir_estado"):
-            try:
-                mod_pedidos.actualizar_estado(pedido_id, nuevo)
-                st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(nuevo)}.")
-                st.rerun()
-            except Exception as e:
-                mostrar_error(e)
+        st.caption("Ya está listo: avísale al cliente y toca **Entregado** cuando lo entregues.")
 
 
 def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
@@ -1058,10 +1117,6 @@ def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
             "Si el cliente paga al recibir, márcalo aquí mismo y se registra el ingreso en Caja. "
             "Si no, queda como **por cobrar** y el pago se registra después."
         )
-        if pedido["items"]:
-            st.caption("Mensaje para avisar la entrega y el monto a pagar:")
-            mensaje_whatsapp(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), pedido["cliente_telefono"])
-            _expander_datos_transferencia(pedido["cliente_telefono"])
 
     with st.form("form_entregar_pedido"):
         pago_al_recibir = False
@@ -1088,6 +1143,7 @@ def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
                 _avisar_pago(pedido_id, medio, resultado)
             else:
                 st.toast(f"Pedido #{pedido_id} entregado.")
+            st.session_state.pop("entregar_pedido_id", None)
             st.rerun()
 
 
@@ -1102,9 +1158,8 @@ def _bloque_registrar_pago(pedido_id: int, pedido: dict):
         st.caption(
             "Entregado sin pago"
             + (f" hace {dias} día(s)" if dias is not None else "")
-            + ". Usa el recordatorio de pago (arriba) para avisarle al cliente."
+            + "."
         )
-        _expander_datos_transferencia(pedido["cliente_telefono"])
         contenedor = st.container()
     else:
         contenedor = st.expander("💸 Registrar pago por adelantado (antes de entregar)")
@@ -1135,7 +1190,7 @@ def _form_registrar_pago(pedido_id: int, sufijo: str):
 
 def _vista_por_cobrar():
     """Pedidos entregados sin pagar: cuánto se debe, hace cuántos días se
-    entregó, a cuáles ya toca recordarles el pago, y el mensaje listo."""
+    entregó y a cuáles ya toca recordarles el pago."""
     config = mod_pedidos.obtener_configuracion_cobranza()
     pedidos = mod_pedidos.listar_por_cobrar()
 
@@ -1166,23 +1221,14 @@ def _vista_por_cobrar():
         st.success("No hay pedidos por cobrar. 🎉")
         return
 
-    _expander_datos_transferencia(None)
-    st.caption("Del más antiguo al más reciente. Abre uno para mandar el recordatorio o registrar el pago.")
+    st.caption("Del más antiguo al más reciente. Abre uno para registrar el pago.")
     for p in pedidos:
         marca = "🔔 " if p["toca_recordar"] else ""
         dias_txt = "hoy" if p["dias_desde_entrega"] == 0 else f"hace {p['dias_desde_entrega']} día(s)"
         monto = f"${p['total']:,.0f}".replace(",", ".")
         with st.expander(f"{marca}#{p['id']} · {p['cliente_nombre']} · {monto} · entregado {dias_txt}"):
-            st.caption("Recordatorio de pago:")
-            mensaje_whatsapp(mod_pedidos.generar_recordatorio_pago_whatsapp(p["id"]), p["cliente_telefono"])
-            if mod_whatsapp.api_configurada() and st.button(
-                "📲 Enviar automático (WhatsApp Business API)", key=f"btn_recordar_{p['id']}"
-            ):
-                try:
-                    mod_whatsapp.enviar_recordatorio_pago(p["id"])
-                    st.success("Recordatorio de pago enviado por WhatsApp.")
-                except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                    mostrar_error(e)
+            if p["cliente_telefono"]:
+                st.caption(f"Teléfono: {p['cliente_telefono']}")
             _form_registrar_pago(p["id"], "por_cobrar")
 
 
@@ -1456,44 +1502,15 @@ def seccion_pedidos():
 
             if pedido["items"]:
                 st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
-
-                api_wsp = mod_whatsapp.api_configurada()
-
-                st.subheader("Resumen para WhatsApp")
-                st.caption("Ábrelo en el chat del cliente con el botón, o cópialo y pégalo.")
-                mensaje_whatsapp(mod_pedidos.generar_resumen_whatsapp(pedido_id), pedido["cliente_telefono"])
-                if api_wsp and st.button("📲 Enviar automático (WhatsApp Business API)", key="btn_enviar_pedido_creado"):
-                    try:
-                        mod_whatsapp.enviar_pedido_creado(pedido_id)
-                        st.success("Mensaje enviado por WhatsApp.")
-                    except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                        mostrar_error(e)
-
-                if not pedido["pagado"] and pedido["estado"] != "cancelado":
-                    with st.expander("💸 Recordatorio de pago"):
-                        mensaje_whatsapp(
-                            mod_pedidos.generar_recordatorio_pago_whatsapp(pedido_id), pedido["cliente_telefono"]
-                        )
-                        if api_wsp and st.button("📲 Enviar automático (WhatsApp Business API)", key="btn_recordatorio_pago"):
-                            try:
-                                mod_whatsapp.enviar_recordatorio_pago(pedido_id)
-                                st.success("Recordatorio de pago enviado por WhatsApp.")
-                            except mod_whatsapp.ErrorEnvioWhatsapp as e:
-                                mostrar_error(e)
             else:
                 st.info("Este pedido todavía no tiene ítems.")
 
-            historial_wsp = mod_whatsapp.historial_mensajes(pedido_id)
-            if historial_wsp:
-                with st.expander(f"Historial de WhatsApp ({len(historial_wsp)})"):
-                    st.dataframe(pd.DataFrame(historial_wsp), width='stretch', hide_index=True)
-
             abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
 
-            if abierto:
-                st.divider()
-                _bloque_estado_pedido(pedido_id, pedido)
+            st.divider()
+            _bloque_estado_pedido(pedido_id, pedido)
 
+            if abierto:
                 st.divider()
                 st.subheader("Reagendar")
                 st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
@@ -1510,9 +1527,6 @@ def seccion_pedidos():
                         st.rerun()
                     except Exception as e:
                         mostrar_error(e)
-
-                st.divider()
-                _bloque_entregar_pedido(pedido_id, pedido)
 
             if not pedido["pagado"] and pedido["estado"] != "cancelado" and pedido["items"]:
                 st.divider()
