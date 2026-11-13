@@ -21,7 +21,7 @@ import uuid
 # de la inicialización: Streamlit Cloud, al recibir un push, recarga el
 # código sin reiniciar el proceso, y sin esta clave el caché viejo hacía
 # que la migración nueva nunca corriera (pasó el 2026-11-04).
-VERSION_ESQUEMA = 2
+VERSION_ESQUEMA = 4
 
 import streamlit as st
 import psycopg2
@@ -176,6 +176,40 @@ def inicializar_db() -> None:
             cantidad REAL NOT NULL CHECK (cantidad > 0),
             UNIQUE (receta_id, ingrediente_id)
         );
+    """)
+
+    # --- Módulo de Stock (ver stock.py) -------------------------------------
+    # `tipo` distingue ingredientes (harina, aceite) de insumos (bolsas,
+    # cajas, etiquetas): ambos viven en la misma tabla y se manejan igual;
+    # cada modelo de bolsa es su propio ítem. `stock_minimo` está en la
+    # unidad base. La cantidad actual NO se guarda: es la suma de
+    # movimientos_stock.
+
+    sentencias.append("""
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'ingrediente'
+            CHECK (tipo IN ('ingrediente', 'insumo'));
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS stock_minimo REAL NOT NULL DEFAULT 0
+            CHECK (stock_minimo >= 0);
+    """)
+
+    # `cantidad` va con signo y en unidad base (compra/ajuste positivo,
+    # uso/merma negativo). Las compras guardan además el formato en que
+    # se compró (ej. "2 × 500 ml") y lo pagado, para trazabilidad.
+    sentencias.append("""
+        CREATE TABLE IF NOT EXISTS movimientos_stock (
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            ingrediente_id INTEGER NOT NULL REFERENCES ingredientes(id) ON DELETE CASCADE,
+            tipo TEXT NOT NULL CHECK (tipo IN ('compra', 'uso', 'merma', 'ajuste')),
+            cantidad REAL NOT NULL CHECK (cantidad <> 0),
+            formato TEXT,
+            precio_total REAL CHECK (precio_total IS NULL OR precio_total >= 0),
+            nota TEXT,
+            fecha TEXT NOT NULL
+        );
+    """)
+    sentencias.append("""
+        CREATE INDEX IF NOT EXISTS idx_movimientos_stock_ingrediente
+            ON movimientos_stock (ingrediente_id);
     """)
 
     # --- Módulo de Flujo de caja -------------------------------------------
@@ -338,6 +372,20 @@ def inicializar_db() -> None:
             precio_unitario REAL NOT NULL CHECK (precio_unitario >= 0),
             UNIQUE (pedido_id, receta_id)
         );
+    """)
+
+    # --- Stock ligado a recetas y pedidos (ver stock.py) -----------------------
+    # `recetas.empaque_ingrediente_id`: la bolsa (ítem de stock) que usa esa
+    # receta, 1 por unidad vendida. Su precio reemplaza al empaque fijo de
+    # configuracion_costos; sin bolsa asignada se sigue usando el fijo.
+    # `movimientos_stock.pedido_id`: de qué pedido salió un movimiento 'uso',
+    # para descontar una sola vez y poder revertir si el pedido vuelve atrás.
+    sentencias.append("""
+        ALTER TABLE recetas ADD COLUMN IF NOT EXISTS empaque_ingrediente_id INTEGER
+            REFERENCES ingredientes(id) ON DELETE SET NULL;
+        ALTER TABLE movimientos_stock ADD COLUMN IF NOT EXISTS pedido_id INTEGER
+            REFERENCES pedidos(id) ON DELETE SET NULL;
+        CREATE INDEX IF NOT EXISTS idx_movimientos_stock_pedido ON movimientos_stock (pedido_id);
     """)
 
     # --- Módulo de Cobranza ---------------------------------------------------

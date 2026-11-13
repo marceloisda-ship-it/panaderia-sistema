@@ -8,7 +8,8 @@ precio de venta.
 Concepto clave — el costo final de una receta tiene tres componentes:
     costo_directo    = suma( cantidad_ingrediente * precio_actual_ingrediente )
     costo_indirecto  = costo_luz                          (consumo del programa de esta receta x tarifa, ver costos_indirectos.py)
-                      + costo_empaque_unidad               (fijo, igual para todas las recetas)
+                      + costo_empaque                      (precio de la bolsa asignada a la receta; si no tiene,
+                                                            el costo_empaque_unidad fijo de costos_indirectos.py)
                       + costo_mano_obra                     (tiempo de esta receta x tu valor hora)
     costo_total      = costo_directo + costo_indirecto
     margen_real      = (precio_venta - costo_total) / precio_venta
@@ -102,6 +103,33 @@ def actualizar_luz(receta_id: int, consumo_kwh_programa: float) -> None:
         conn.close()
 
 
+def actualizar_empaque(receta_id: int, ingrediente_id: int | None) -> None:
+    """Asigna la bolsa (un ítem de stock, normalmente un insumo en 'unidad')
+    que usa esta receta, 1 por unidad vendida; su precio pasa a ser el costo
+    de empaque de la receta y se descuenta del stock con cada pedido. Con
+    None se quita y vuelve a aplicar el empaque fijo de Costos indirectos."""
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        if ingrediente_id is not None:
+            cursor.execute("SELECT unidad_base FROM ingredientes WHERE id = %s", (ingrediente_id,))
+            fila = cursor.fetchone()
+            if fila is None:
+                raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
+            if fila["unidad_base"] != "unidad":
+                raise ValueError("La bolsa debe ser un ítem en 'unidad' (se usa 1 por pan vendido)")
+        cursor.execute(
+            "UPDATE recetas SET empaque_ingrediente_id = %s WHERE id = %s",
+            (ingrediente_id, receta_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def agregar_ingrediente_a_receta(receta_id: int, ingrediente_id: int, cantidad: float) -> None:
     """Agrega (o actualiza, si ya existía) un ingrediente dentro de una receta.
 
@@ -138,7 +166,13 @@ def quitar_ingrediente_de_receta(receta_id: int, ingrediente_id: int) -> None:
 
 
 def _obtener_receta(conn, receta_id: int) -> dict:
-    fila = conn.execute("SELECT * FROM recetas WHERE id = %s", (receta_id,)).fetchone()
+    fila = conn.execute(
+        """SELECT r.*, e.nombre AS empaque_nombre, e.precio_actual AS empaque_precio
+           FROM recetas r
+           LEFT JOIN ingredientes e ON e.id = r.empaque_ingrediente_id
+           WHERE r.id = %s""",
+        (receta_id,),
+    ).fetchone()
     if fila is None:
         raise ValueError(f"No existe una receta con id {receta_id}")
     return dict(fila)
@@ -171,7 +205,12 @@ def _calcular_costo(receta: dict, filas_ingredientes: list, config: dict) -> dic
     costo_indirecto_luz = (
         receta["consumo_kwh_programa"] * config["tarifa_electrica_kwh"] * config["factor_descuento_luz"]
     )
-    costo_empaque = config["costo_empaque_unidad"]
+    # Con bolsa asignada manda su precio (una bolsa plástica y una de papel
+    # no cuestan lo mismo); sin bolsa, el empaque fijo de la configuración.
+    if receta.get("empaque_ingrediente_id") is not None:
+        costo_empaque = receta["empaque_precio"]
+    else:
+        costo_empaque = config["costo_empaque_unidad"]
     costo_mano_obra = (
         receta["tiempo_preparacion_min"] / 60 * config["valor_hora_mano_obra"]
         / receta["unidades_por_lote"]
@@ -194,6 +233,8 @@ def _calcular_costo(receta: dict, filas_ingredientes: list, config: dict) -> dic
         "tiempo_preparacion_min": receta["tiempo_preparacion_min"],
         "unidades_por_lote": receta["unidades_por_lote"],
         "consumo_kwh_programa": receta["consumo_kwh_programa"],
+        "empaque_ingrediente_id": receta.get("empaque_ingrediente_id"),
+        "empaque_nombre": receta.get("empaque_nombre"),
         "ingredientes": ingredientes,
         "costo_directo": round(costo_directo, 2),
         "costo_indirecto_luz": round(costo_indirecto_luz, 2),
@@ -238,10 +279,12 @@ def listar_recetas(solo_activas: bool = True) -> list[dict]:
     Trae las recetas y sus ingredientes en 2 consultas (no 1 por receta) y
     reutiliza una sola conexión — con SQLite local esto no importaba, pero
     contra Supabase cada conexión de más suma latencia de red real."""
-    query = "SELECT * FROM recetas"
+    query = """SELECT r.*, e.nombre AS empaque_nombre, e.precio_actual AS empaque_precio
+               FROM recetas r
+               LEFT JOIN ingredientes e ON e.id = r.empaque_ingrediente_id"""
     if solo_activas:
-        query += " WHERE activo = TRUE"
-    query += " ORDER BY nombre ASC"
+        query += " WHERE r.activo = TRUE"
+    query += " ORDER BY r.nombre ASC"
 
     conn = conectar()
     try:

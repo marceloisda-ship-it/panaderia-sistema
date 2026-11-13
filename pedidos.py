@@ -28,6 +28,7 @@ caja (ver caja.py) y, si aplica, el gasto por comisión.
 from datetime import date, datetime, timedelta
 from db import conectar, cache_lectura
 import caja as mod_caja
+import stock as mod_stock
 
 ESTADOS_VALIDOS = ("recibido", "confirmado", "en_produccion", "listo", "entregado", "cancelado")
 # Estados de un pedido "vivo": todavía se puede editar, reagendar o cancelar.
@@ -438,14 +439,26 @@ def listar_pedidos_resumen(estado: str | None = None) -> list[dict]:
         conn.close()
 
 
-def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
+def actualizar_estado(pedido_id: int, nuevo_estado: str) -> list[dict]:
     """Mueve un pedido abierto a otro estado abierto (recibido,
     confirmado, en producción, listo) o lo cancela. Se permite volver
     atrás (ej. de 'listo' a 'en producción') para corregir un error.
 
     Para entregar se usa `marcar_entregado` (o `entregar_y_cobrar`), que
     además registran la fecha de entrega. Un pedido ya entregado o
-    cancelado no cambia de estado."""
+    cancelado no cambia de estado.
+
+    Stock (ver stock.py), en la misma transacción que el cambio de estado:
+    - al pasar a 'en_produccion' se descuentan los ingredientes y las
+      bolsas del pedido (una sola vez; 'listo' también descuenta si el
+      pedido se saltó la producción);
+    - al volver a 'recibido' o 'confirmado' se devuelven al stock;
+    - cancelar NO devuelve nada: si el pedido ya se horneó, los insumos
+      se gastaron igual (si no, se corrige con un conteo en Stock).
+
+    Retorna los ingredientes que faltan para el pedido (lista vacía si no
+    falta nada) al pasar a 'confirmado' o 'en_produccion'. Es un aviso: no
+    bloquea el cambio de estado."""
     if nuevo_estado not in ESTADOS_VALIDOS:
         raise ValueError(f"estado debe ser uno de {ESTADOS_VALIDOS}")
     if nuevo_estado == "entregado":
@@ -457,14 +470,28 @@ def actualizar_estado(pedido_id: int, nuevo_estado: str) -> None:
             raise ValueError(f"No existe un pedido con id {pedido_id}")
         if fila["estado"] not in ESTADOS_ABIERTOS:
             raise ValueError(f"El pedido ya está '{etiqueta_estado(fila['estado'])}', no cambia de estado")
+
+        cursor = conn.cursor()
+        faltantes = []
+        if nuevo_estado in ("recibido", "confirmado"):
+            mod_stock.revertir_pedido_en_cursor(cursor, pedido_id)
+        if nuevo_estado in ("confirmado", "en_produccion"):
+            faltantes = mod_stock.faltantes_pedido_en_cursor(cursor, pedido_id)
+        if nuevo_estado in ("en_produccion", "listo"):
+            mod_stock.descontar_pedido_en_cursor(cursor, pedido_id)
+
         conn.execute("UPDATE pedidos SET estado = %s WHERE id = %s", (nuevo_estado, pedido_id))
         conn.commit()
+        return faltantes
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
 
 def cancelar_pedido(pedido_id: int) -> None:
-    actualizar_estado(pedido_id, "cancelado")
+    actualizar_estado(pedido_id, "cancelado")  # no mueve stock, ver actualizar_estado
 
 
 def eliminar_pedido(pedido_id: int) -> None:
@@ -487,8 +514,14 @@ def eliminar_pedido(pedido_id: int) -> None:
                 "si prefieres conservar el registro."
             )
 
+        # Un pedido eliminado es como si nunca hubiera existido: si ya había
+        # descontado stock, se devuelve.
+        mod_stock.revertir_pedido_en_cursor(conn.cursor(), pedido_id)
         conn.execute("DELETE FROM pedidos WHERE id = %s", (pedido_id,))
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -599,11 +632,16 @@ def marcar_entregado(pedido_id: int, fecha: str | None = None) -> None:
     fecha = fecha or date.today().isoformat()
     conn = conectar()
     try:
+        # Si el pedido nunca pasó por 'en producción', se descuenta ahora.
+        mod_stock.descontar_pedido_en_cursor(conn.cursor(), pedido_id)
         conn.execute(
             "UPDATE pedidos SET estado = 'entregado', fecha_entregado = %s WHERE id = %s",
             (fecha, pedido_id),
         )
         conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -654,6 +692,7 @@ def entregar_y_cobrar(pedido_id: int, medio_pago: str, fecha: str | None = None)
 
     conn = conectar()
     try:
+        mod_stock.descontar_pedido_en_cursor(conn.cursor(), pedido_id)
         conn.execute(
             "UPDATE pedidos SET estado = 'entregado', fecha_entregado = %s WHERE id = %s",
             (fecha, pedido_id),

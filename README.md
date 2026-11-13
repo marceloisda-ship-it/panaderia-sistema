@@ -55,6 +55,7 @@ ese archivo como respaldo cuando quieras.
 panaderia_sistema/
 ├── db.py             # Conexión y esquema de la base de datos
 ├── ingredientes.py   # Lógica de ingredientes y su historial de precios
+├── stock.py          # Stock por movimientos: compras por formato, mermas, conteos, por reponer
 ├── recetas.py        # Lógica de recetas: costeo automático y margen
 ├── caja.py               # Lógica de flujo de caja: ingresos, gastos y reportes
 ├── costos_indirectos.py  # Configuración de luz, empaque y mano de obra
@@ -340,19 +341,45 @@ retomar:
 
 Detalle de lo conversado, para cuando llegue su turno:
 
-- [ ] Cantidad actual y **mínimo** por ingrediente, con tres estados:
-      hay / queda poco / sin stock.
-- [ ] Stock por **movimientos** (compra, uso, ajuste por merma o
-      conteo), no editando el número a mano.
-- [ ] Vista **Por reponer**: lo que está bajo el mínimo, agrupado por
-      proveedor, con costo estimado según el último precio.
-- [ ] Descontar automáticamente al pasar un pedido a `en producción`,
-      según la receta.
-- [ ] Avisar al confirmar un pedido si faltan ingredientes.
+- [x] Cantidad actual y **mínimo** por ingrediente, con tres estados:
+      hay / queda poco / sin stock. *(2026-11-13, `stock.py`)*
+- [x] Stock por **movimientos** (compra, uso, ajuste por merma o
+      conteo), no editando el número a mano. *(tabla `movimientos_stock`;
+      la cantidad actual es la suma de movimientos)*
+- [x] Vista **Por reponer**: lo que está bajo el mínimo, agrupado por
+      proveedor, con costo estimado según el último precio. *(la cantidad
+      sugerida es lo que falta para volver al mínimo)*
+- [x] Descontar automáticamente al pasar un pedido a `en producción`,
+      según la receta (ingredientes × cantidad del ítem, más 1 bolsa por
+      pan). *(2026-11-13)* Una sola vez por pedido; si el pedido vuelve a
+      `recibido`/`confirmado` se devuelve al stock; si salta la
+      producción, se descuenta al entregar. **Cancelar no devuelve
+      stock** (se asume que ya se horneó; se corrige con un conteo).
+      Permite stock negativo para no frenar la producción.
+- [x] Avisar si faltan ingredientes: al confirmar o pasar a producción
+      (aviso, no bloquea) y de forma permanente en el detalle del pedido
+      mientras esté `recibido`/`confirmado`.
+- [x] **Bolsa por receta**: cada receta puede tener su bolsa (papel,
+      plástica…); su precio reemplaza al empaque fijo en el costeo y se
+      descuenta del stock. Sin bolsa asignada sigue el empaque fijo de
+      Costos indirectos.
 - [ ] Más adelante: anticipar faltantes según los pedidos confirmados
       de la semana.
-- Por definir: si se incluyen insumos (bolsas, etiquetas, cajas) y cómo
-  se ingresan las compras (ej. un saco de 25 kg convertido a gramos).
+- **Definido (2026-11-13)**:
+  - **Insumos**: sí se incluyen. Son ítems de la misma tabla que los
+    ingredientes, con `tipo = 'insumo'` y unidad `unidad`. Cada modelo de
+    bolsa (papel, plástica, otra) es un ítem propio. Hoy no hay cajas;
+    si aparecen, se agregan igual como un ítem más.
+  - **Compras**: se ingresan en el formato real (una botella de 500 ml,
+    otra de 2000 ml, un saco de 1 kg, un pack de 100 bolsas) con
+    cantidad, tamaño, unidad y precio de cada uno; el sistema convierte
+    a unidad base (1 kg → 1.000 gr, 1 l → 1.000 ml) y deja el precio de
+    la última compra como precio actual (con registro en el historial).
+  - **Caja**: las compras del stock NO generan gasto en Caja. La compra
+    completa (nueces, harina, sal…) se sigue registrando como un solo
+    gasto en Caja y el precio por gr/ml de cada ítem se prorratea
+    aparte; en Stock → Registrar compra se ingresa ese precio de cada
+    formato, para evitar duplicar el gasto.
 
 ### Etapa 5 — Mensajes automáticos por WhatsApp
 
@@ -477,6 +504,24 @@ quitar un ítem.
 
 **Siguiente paso**: responder las **Preguntas abiertas antes de las
 Etapas 3 y 4** (sección Pasos a seguir) y seguir con la Etapa 3.
+
+### 2026-11-13 — Stock (Etapa 4, primera versión)
+
+- Módulo nuevo `stock.py` y sección **Stock** en la app: resumen con
+  estados, compras por formato, conteo/merma, por reponer, movimientos.
+- Insumos (bolsas) como ítems con `tipo = 'insumo'`; **bolsa por receta**
+  que reemplaza al empaque fijo en el costeo.
+- Pedidos: descuento de stock al pasar a `en_produccion`, devolución al
+  retroceder, y aviso de ingredientes faltantes.
+- Esquema: `VERSION_ESQUEMA = 4` (columnas `ingredientes.tipo`,
+  `ingredientes.stock_minimo`, `recetas.empaque_ingrediente_id`, tabla
+  `movimientos_stock`).
+- **Pendiente de verificar en la app**: todo lo anterior, no se pudo
+  probar localmente (ver notas técnicas). La lógica de descuento se
+  probó contra una base SQLite simulada.
+- **Siguiente paso**: cargar el inventario inicial (Stock → Contar /
+  ajustar) y los mínimos; luego anticipar faltantes según los pedidos
+  confirmados de la semana.
 
 ### Notas técnicas para retomar
 

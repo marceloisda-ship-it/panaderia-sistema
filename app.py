@@ -18,6 +18,7 @@ import streamlit as st
 from db import inicializar_db, VERSION_ESQUEMA
 import auth
 import ingredientes as mod_ing
+import stock as mod_stock
 import recetas as mod_rec
 import caja as mod_caja
 import costos_indirectos as mod_costos
@@ -166,7 +167,7 @@ def seccion_ingredientes():
                 st.info("Ningún ingrediente coincide con la búsqueda.")
             else:
                 df = pd.DataFrame(ings)[
-                    ["id", "nombre", "unidad_base", "precio_actual", "proveedor", "fecha_actualizacion"]
+                    ["id", "nombre", "tipo", "unidad_base", "precio_actual", "proveedor", "fecha_actualizacion"]
                 ]
                 st.dataframe(df, width='stretch', hide_index=True)
 
@@ -176,10 +177,19 @@ def seccion_ingredientes():
             unidad = st.selectbox("Unidad base", ["gr", "ml", "unidad"])
             precio = st.number_input("Precio actual", min_value=0.0, step=1.0)
             proveedor = st.text_input("Proveedor (opcional)")
+            tipo = st.selectbox(
+                "Tipo", list(mod_ing.TIPOS_VALIDOS),
+                help="Insumo = bolsas, cajas, etiquetas. Cada modelo de bolsa es un ítem aparte, en 'unidad'.",
+            )
+            minimo = st.number_input(
+                "Stock mínimo (en la unidad base; 0 = sin aviso)", min_value=0.0, step=1.0
+            )
             enviado = st.form_submit_button("Guardar ingrediente")
         if enviado:
             try:
-                ing_id = mod_ing.agregar_ingrediente(nombre, unidad, precio, proveedor or None)
+                ing_id = mod_ing.agregar_ingrediente(
+                    nombre, unidad, precio, proveedor or None, tipo=tipo, stock_minimo=minimo
+                )
                 st.success(f"Ingrediente creado con id {ing_id}")
             except Exception as e:
                 mostrar_error(e)
@@ -261,6 +271,200 @@ def seccion_ingredientes():
                         st.rerun()
                     except Exception as e:
                         mostrar_error(e)
+
+
+# --- Sección: Stock ---------------------------------------------------------
+
+def _fmt_cantidad(valor: float, unidad: str) -> str:
+    """Cantidad con separador de miles '.' y decimales ',' (formato chileno)."""
+    decimales = 0 if abs(valor - round(valor)) < 1e-9 else 2
+    texto = f"{valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{texto} {unidad}"
+
+
+def seccion_stock():
+    st.header("📦 Stock")
+    vista = st.radio(
+        "Sección",
+        ["Resumen", "Registrar compra", "Contar / ajustar", "Por reponer", "Movimientos", "Configurar"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_stock",
+    )
+
+    if vista == "Resumen":
+        items = mod_stock.listar_stock()
+        if not items:
+            st.info("No hay ingredientes ni insumos cargados todavía.")
+            return
+        col_t, col_e, col_b = st.columns([1, 1, 2])
+        tipo = col_t.selectbox("Tipo", ["Todos", "ingrediente", "insumo"], key="stock_filtro_tipo")
+        estado = col_e.selectbox(
+            "Estado", ["Todos"] + [mod_stock.ETIQUETAS_ESTADO_STOCK[e] for e in mod_stock.ESTADOS_STOCK],
+            key="stock_filtro_estado",
+        )
+        busqueda = col_b.text_input("Buscar por nombre", key="stock_buscar")
+        if tipo != "Todos":
+            items = [i for i in items if i["tipo"] == tipo]
+        if estado != "Todos":
+            items = [i for i in items if mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]] == estado]
+        if busqueda.strip():
+            items = [i for i in items if busqueda.strip().lower() in i["nombre"].lower()]
+
+        todos = mod_stock.listar_stock()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sin stock", sum(1 for i in todos if i["estado"] == "sin_stock"))
+        c2.metric("Queda poco", sum(1 for i in todos if i["estado"] == "queda_poco"))
+        c3.metric("Valor del stock", f"${sum(i['valor_stock'] for i in todos):,.0f}".replace(",", "."))
+
+        if not items:
+            st.info("Ningún ítem coincide con los filtros.")
+        else:
+            df = pd.DataFrame([
+                {
+                    "Estado": mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]],
+                    "Ítem": i["nombre"],
+                    "Tipo": i["tipo"],
+                    "Stock": _fmt_cantidad(i["stock_actual"], i["unidad_base"]),
+                    "Mínimo": _fmt_cantidad(i["stock_minimo"], i["unidad_base"]),
+                    "Proveedor": i["proveedor"] or "—",
+                }
+                for i in items
+            ])
+            st.dataframe(df, width='stretch', hide_index=True)
+
+    elif vista == "Registrar compra":
+        ing_id, ing = selector_ingrediente("Ítem comprado", "stock_sel_compra")
+        if ing_id is not None:
+            base = ing["unidad_base"]
+            st.caption(
+                f"Se ingresa en el formato en que lo compraste; el sistema lo pasa a {base}. "
+                f"Precio actual: ${ing['precio_actual']:.4f} / {base}"
+            )
+            with st.form("form_registrar_compra", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                cantidad = c1.number_input("Cuántos compraste", min_value=1.0, value=1.0, step=1.0)
+                tamano = c2.number_input("Tamaño de cada uno", min_value=0.0, step=1.0,
+                                         help="Ej. 500 (botella de 500 ml), 25 (saco de 25 kg), 100 (pack de 100 bolsas)")
+                unidad_fmt = c3.selectbox("Unidad del tamaño", list(mod_stock.UNIDADES_FORMATO[base]))
+                precio = st.number_input("Precio de cada uno", min_value=0.0, step=100.0)
+                proveedor = st.text_input("Proveedor (opcional)", value=ing["proveedor"] or "")
+                nota = st.text_input("Nota (opcional)")
+                enviado = st.form_submit_button("Registrar compra")
+            if enviado:
+                try:
+                    r = mod_stock.registrar_compra(
+                        ing_id, cantidad, tamano, unidad_fmt, precio, proveedor or None, nota or None
+                    )
+                    st.success(
+                        f"Compra registrada: +{_fmt_cantidad(r['cantidad_base'], base)} · "
+                        f"${r['precio_por_unidad_base']:.4f} / {base} · "
+                        f"stock ahora {_fmt_cantidad(r['stock_actual'], base)}"
+                    )
+                except Exception as e:
+                    mostrar_error(e)
+
+    elif vista == "Contar / ajustar":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_ajuste")
+        if ing_id is not None:
+            base = ing["unidad_base"]
+            actual = next(i["stock_actual"] for i in mod_stock.listar_stock() if i["id"] == ing_id)
+            st.caption(f"Stock en el sistema: {_fmt_cantidad(actual, base)}")
+
+            st.subheader("Conteo físico")
+            st.caption("Escribe lo que realmente hay: el sistema registra la diferencia. También sirve para cargar el stock inicial.")
+            with st.form("form_conteo", clear_on_submit=True):
+                real = st.number_input(f"Cantidad real ({base})", min_value=0.0, step=1.0)
+                nota = st.text_input("Nota (opcional)", key="nota_conteo")
+                enviado = st.form_submit_button("Aplicar conteo")
+            if enviado:
+                try:
+                    dif = mod_stock.registrar_conteo(ing_id, real, nota or None)
+                    st.success("El conteo coincide con el sistema." if dif == 0
+                               else f"Ajuste registrado: {dif:+,.2f} {base}")
+                except Exception as e:
+                    mostrar_error(e)
+
+            st.divider()
+            st.subheader("Merma")
+            with st.form("form_merma", clear_on_submit=True):
+                perdida = st.number_input(f"Cantidad perdida ({base})", min_value=0.0, step=1.0)
+                nota_m = st.text_input("Motivo (opcional)", key="nota_merma")
+                enviado_m = st.form_submit_button("Registrar merma")
+            if enviado_m:
+                try:
+                    mod_stock.registrar_merma(ing_id, perdida, nota_m or None)
+                    st.success("Merma registrada.")
+                except Exception as e:
+                    mostrar_error(e)
+
+    elif vista == "Por reponer":
+        pendientes = mod_stock.listar_por_reponer()
+        if not pendientes:
+            st.success("Nada por reponer: todo lo que tiene mínimo definido está sobre ese mínimo.")
+            return
+        st.caption(
+            "Cantidad = lo que falta para volver al mínimo; costo según el último precio. "
+            "Solo aparecen ítems con mínimo definido (pestaña Configurar)."
+        )
+        grupos: dict[str, list[dict]] = {}
+        for p in pendientes:
+            grupos.setdefault(p["proveedor"] or "Sin proveedor", []).append(p)
+        total = 0.0
+        for proveedor in sorted(grupos):
+            items = grupos[proveedor]
+            subtotal = sum(i["costo_estimado"] for i in items)
+            total += subtotal
+            st.subheader(f"{proveedor} · ${subtotal:,.0f}".replace(",", "."))
+            st.dataframe(pd.DataFrame([
+                {
+                    "Estado": mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]],
+                    "Ítem": i["nombre"],
+                    "Stock": _fmt_cantidad(i["stock_actual"], i["unidad_base"]),
+                    "Falta": _fmt_cantidad(i["faltante"], i["unidad_base"]),
+                    "Costo estimado": f"${i['costo_estimado']:,.0f}".replace(",", "."),
+                }
+                for i in items
+            ]), width='stretch', hide_index=True)
+        st.metric("Costo estimado total", f"${total:,.0f}".replace(",", "."))
+
+    elif vista == "Movimientos":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_mov")
+        if ing_id is not None:
+            movs = mod_stock.listar_movimientos(ing_id)
+            if not movs:
+                st.info("Sin movimientos todavía.")
+            else:
+                st.dataframe(pd.DataFrame([
+                    {
+                        "Fecha": m["fecha"],
+                        "Tipo": m["tipo"],
+                        "Cantidad": _fmt_cantidad(m["cantidad"], ing["unidad_base"]),
+                        "Formato": m["formato"] or "",
+                        "Pagado": f"${m['precio_total']:,.0f}".replace(",", ".") if m["precio_total"] is not None else "",
+                        "Nota": m["nota"] or "",
+                    }
+                    for m in movs
+                ]), width='stretch', hide_index=True)
+
+    elif vista == "Configurar":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_config")
+        if ing_id is not None:
+            with st.form(f"form_config_stock_{ing_id}"):
+                tipos = list(mod_ing.TIPOS_VALIDOS)
+                tipo = st.selectbox("Tipo", tipos, index=tipos.index(ing["tipo"]))
+                minimo = st.number_input(
+                    f"Stock mínimo ({ing['unidad_base']}; 0 = sin aviso)",
+                    min_value=0.0, step=1.0, value=float(ing["stock_minimo"]),
+                )
+                enviado = st.form_submit_button("Guardar")
+            if enviado:
+                try:
+                    mod_stock.configurar_item(ing_id, tipo, minimo)
+                    st.success("Configuración guardada.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
 
 
 # --- Sección: Recetas -------------------------------------------------
@@ -447,6 +651,36 @@ def seccion_recetas():
                 st.dataframe(pd.DataFrame(d["ingredientes"]), width='stretch', hide_index=True)
             else:
                 st.info("Esta receta todavía no tiene ingredientes.")
+
+            st.subheader("Empaque de esta receta")
+            bolsas = [i for i in mod_ing.listar_ingredientes() if i["unidad_base"] == "unidad"]
+            if d["empaque_ingrediente_id"] is not None:
+                st.caption(f"Actual: {d['empaque_nombre']} (${d['costo_empaque']:.2f} por unidad vendida)")
+            else:
+                st.caption(
+                    f"Sin bolsa asignada: se usa el empaque fijo de Costos indirectos "
+                    f"(${d['costo_empaque']:.2f} por unidad vendida)."
+                )
+            if not bolsas:
+                st.info("Aún no hay ítems en 'unidad'. Agrega las bolsas en Ingredientes (tipo insumo, unidad 'unidad').")
+            else:
+                sin_bolsa = "(sin bolsa: usar empaque fijo)"
+                opciones_bolsa = {sin_bolsa: None}
+                opciones_bolsa.update({f"{b['nombre']} · ${b['precio_actual']:.2f} c/u": b["id"] for b in bolsas})
+                etiquetas = list(opciones_bolsa)
+                actual = next(
+                    (k for k, v in opciones_bolsa.items() if v == d["empaque_ingrediente_id"]), sin_bolsa
+                )
+                with st.form(f"form_empaque_detalle_{receta_id}"):
+                    elegida = st.selectbox("Bolsa que usa", etiquetas, index=etiquetas.index(actual))
+                    enviado_emp = st.form_submit_button("Actualizar empaque")
+                if enviado_emp:
+                    try:
+                        mod_rec.actualizar_empaque(receta_id, opciones_bolsa[elegida])
+                        st.success("Empaque actualizado. Se descuenta 1 por pan vendido al pasar un pedido a producción.")
+                        st.rerun()
+                    except Exception as e:
+                        mostrar_error(e)
 
             st.subheader("Mano de obra de esta receta")
             st.caption(
@@ -688,7 +922,8 @@ def seccion_costos_indirectos():
             value=float(config["factor_descuento_luz"] * 100),
         )
         costo_empaque = st.number_input(
-            "Costo de empaque por unidad vendida (bolsa, caja, etc.) — igual para todas las recetas",
+            "Costo de empaque por unidad vendida — solo para recetas sin bolsa asignada "
+            "(las que tienen bolsa usan el precio de esa bolsa; se asigna en Recetas → Detalle)",
             min_value=0.0, step=1.0,
             value=float(config["costo_empaque_unidad"]),
         )
@@ -1057,6 +1292,26 @@ def _avisar_pago(pedido_id: int, medio: str, resultado: dict):
     st.toast(mensaje)
 
 
+def _texto_faltantes(faltantes: list[dict]) -> str:
+    return ", ".join(
+        f"{f['nombre']} (falta {_fmt_cantidad(f['falta'], f['unidad_base'])})" for f in faltantes
+    )
+
+
+def _bloque_faltantes_pedido(pedido_id: int, pedido: dict):
+    """Aviso de ingredientes que no alcanzan, mientras el pedido todavía no
+    descuenta stock (recibido o confirmado)."""
+    if pedido["estado"] not in ("recibido", "confirmado") or not pedido["items"]:
+        return
+    faltantes = mod_stock.faltantes_pedido(pedido_id)
+    if faltantes:
+        st.warning(
+            "📦 Con el stock actual **no alcanzan** los ingredientes: "
+            + _texto_faltantes(faltantes)
+            + ". Se pueden registrar compras en Stock; igual se puede seguir con el pedido."
+        )
+
+
 def _bloque_estado_pedido(pedido_id: int, pedido: dict):
     """Línea de tiempo del pedido. Si está abierto, tocar un paso lo mueve
     a ese estado (también hacia atrás, para corregir); tocar "Entregado"
@@ -1075,9 +1330,14 @@ def _bloque_estado_pedido(pedido_id: int, pedido: dict):
         entregas_abiertas.add(pedido_id)
     elif elegido:
         try:
-            mod_pedidos.actualizar_estado(pedido_id, elegido)
+            faltantes = mod_pedidos.actualizar_estado(pedido_id, elegido)
             entregas_abiertas.discard(pedido_id)
             st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(elegido)}.")
+            if elegido == "en_produccion":
+                st.toast("Stock descontado según la receta.", icon="📦")
+            if faltantes:
+                # El toast sobrevive al st.rerun() de abajo; un st.warning no.
+                st.toast("⚠ Faltan ingredientes: " + _texto_faltantes(faltantes), icon="⚠️")
         except Exception as e:
             mostrar_error(e)
         else:
@@ -1270,6 +1530,8 @@ def _detalle_pedido_completo(pedido_id: int):
         st.info("Este pedido todavía no tiene ítems.")
 
     abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
+
+    _bloque_faltantes_pedido(pedido_id, pedido)
 
     st.divider()
     _bloque_estado_pedido(pedido_id, pedido)
@@ -1857,13 +2119,15 @@ st.sidebar.title("🥖 Panadería")
 auth.mostrar_sesion_activa()
 seccion = st.sidebar.radio(
     "Módulo",
-    ["Dashboard", "Ingredientes", "Recetas", "Flujo de caja", "Costos indirectos", "Pedidos", "Clientes"],
+    ["Dashboard", "Ingredientes", "Stock", "Recetas", "Flujo de caja", "Costos indirectos", "Pedidos", "Clientes"],
 )
 
 if seccion == "Dashboard":
     seccion_dashboard()
 elif seccion == "Ingredientes":
     seccion_ingredientes()
+elif seccion == "Stock":
+    seccion_stock()
 elif seccion == "Recetas":
     seccion_recetas()
 elif seccion == "Flujo de caja":

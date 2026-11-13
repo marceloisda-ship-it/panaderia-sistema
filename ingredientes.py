@@ -13,26 +13,36 @@ from db import conectar, cache_lectura
 UNIDADES_VALIDAS = ("gr", "ml", "unidad")
 
 
+TIPOS_VALIDOS = ("ingrediente", "insumo")
+
+
 def agregar_ingrediente(nombre: str, unidad_base: str, precio_actual: float,
-                         proveedor: str | None = None) -> int:
-    """Registra un nuevo ingrediente y guarda su primer precio en el historial.
+                         proveedor: str | None = None, tipo: str = "ingrediente",
+                         stock_minimo: float = 0) -> int:
+    """Registra un nuevo ingrediente (o insumo: bolsa, caja, etiqueta) y
+    guarda su primer precio en el historial.
 
     Retorna el id del ingrediente creado.
     """
     if unidad_base not in UNIDADES_VALIDAS:
         raise ValueError(f"unidad_base debe ser una de {UNIDADES_VALIDAS}")
+    if tipo not in TIPOS_VALIDOS:
+        raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
     if precio_actual < 0:
         raise ValueError("El precio no puede ser negativo")
+    if stock_minimo < 0:
+        raise ValueError("El stock mínimo no puede ser negativo")
 
     fecha = datetime.now().isoformat(timespec="seconds")
     conn = conectar()
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO ingredientes (nombre, unidad_base, precio_actual, proveedor, fecha_actualizacion)
-               VALUES (%s, %s, %s, %s, %s)
+            """INSERT INTO ingredientes
+                   (nombre, unidad_base, precio_actual, proveedor, fecha_actualizacion, tipo, stock_minimo)
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
                RETURNING id""",
-            (nombre, unidad_base, precio_actual, proveedor, fecha),
+            (nombre, unidad_base, precio_actual, proveedor, fecha, tipo, stock_minimo),
         )
         ingrediente_id = cursor.fetchone()["id"]
         cursor.execute(
