@@ -395,12 +395,15 @@ def inicializar_db() -> None:
     # insumos que ya eran la bolsa de alguna receta, o que se llaman
     # bolsa/caja/empaque, pasan a 'empaque'; el resto de insumos a 'otro'
     # (se corrige en Stock → Configurar). Idempotente: solo toca categoria NULL.
+    # Ojo: aquí no se puede usar LIKE '%…%': conn.execute pasa params y
+    # psycopg2 toma cada % como marcador (dio IndexError el 2026-11-17).
     sentencias.append("""
         ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS categoria TEXT;
         UPDATE ingredientes SET categoria = 'empaque'
             WHERE tipo = 'insumo' AND categoria IS NULL
               AND (id IN (SELECT empaque_ingrediente_id FROM recetas WHERE empaque_ingrediente_id IS NOT NULL)
-                   OR nombre ILIKE '%bolsa%' OR nombre ILIKE '%caja%' OR nombre ILIKE '%empaque%');
+                   OR strpos(lower(nombre), 'bolsa') > 0 OR strpos(lower(nombre), 'caja') > 0
+                   OR strpos(lower(nombre), 'empaque') > 0);
         UPDATE ingredientes SET categoria = 'otro' WHERE tipo = 'insumo' AND categoria IS NULL;
     """)
 
