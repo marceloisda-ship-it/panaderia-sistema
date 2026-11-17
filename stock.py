@@ -25,6 +25,7 @@ Bolsas: cada modelo (papel, plástica, otra) es un ítem propio de tipo
 
 from datetime import datetime
 from db import conectar, cache_lectura
+import ingredientes
 
 # Cómo se puede expresar el tamaño de un formato de compra, según la unidad
 # base del ingrediente, y su equivalente en esa unidad base.
@@ -215,19 +216,33 @@ def _registrar_simple(ingrediente_id: int, tipo: str, cantidad: float, nota: str
         conn.close()
 
 
-def configurar_item(ingrediente_id: int, tipo: str, stock_minimo: float) -> None:
-    """Define si es ingrediente o insumo y su stock mínimo (en unidad base)."""
-    if tipo not in ("ingrediente", "insumo"):
-        raise ValueError("tipo debe ser 'ingrediente' o 'insumo'")
+def configurar_item(ingrediente_id: int, tipo: str, stock_minimo: float,
+                    categoria: str | None = None) -> None:
+    """Define si es ingrediente o insumo (con su categoría: empaque, papel,
+    protección, limpieza u otro) y su stock mínimo (en unidad base)."""
     if stock_minimo < 0:
         raise ValueError("El stock mínimo no puede ser negativo")
+    categoria = ingredientes.normalizar_categoria(tipo, categoria)
     conn = conectar()
     try:
         cursor = conn.cursor()
-        _obtener_ingrediente(cursor, ingrediente_id)
+        ing = _obtener_ingrediente(cursor, ingrediente_id)
+        if categoria == "empaque" and ing["unidad_base"] != "unidad":
+            raise ValueError("Un empaque debe estar en 'unidad' (se usa 1 por pan vendido)")
+        if categoria != "empaque":
+            cursor.execute(
+                "SELECT nombre FROM recetas WHERE empaque_ingrediente_id = %s ORDER BY nombre",
+                (ingrediente_id,),
+            )
+            usan = [f["nombre"] for f in cursor.fetchall()]
+            if usan:
+                raise ValueError(
+                    "Es el empaque de " + ", ".join(usan) + ": cámbialo allí (Recetas → Detalle) "
+                    "antes de quitarle la categoría 'empaque'."
+                )
         cursor.execute(
-            "UPDATE ingredientes SET tipo = %s, stock_minimo = %s WHERE id = %s",
-            (tipo, stock_minimo, ingrediente_id),
+            "UPDATE ingredientes SET tipo = %s, categoria = %s, stock_minimo = %s WHERE id = %s",
+            (tipo, categoria, stock_minimo, ingrediente_id),
         )
         conn.commit()
     except Exception:
@@ -358,7 +373,7 @@ def listar_stock() -> list[dict]:
     conn = conectar()
     try:
         filas = conn.execute(
-            """SELECT i.id, i.nombre, i.tipo, i.unidad_base, i.precio_actual, i.proveedor,
+            """SELECT i.id, i.nombre, i.tipo, i.categoria, i.unidad_base, i.precio_actual, i.proveedor,
                       i.stock_minimo, COALESCE(SUM(m.cantidad), 0) AS stock_actual
                FROM ingredientes i
                LEFT JOIN movimientos_stock m ON m.ingrediente_id = i.id

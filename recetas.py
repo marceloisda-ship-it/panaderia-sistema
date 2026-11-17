@@ -104,7 +104,7 @@ def actualizar_luz(receta_id: int, consumo_kwh_programa: float) -> None:
 
 
 def actualizar_empaque(receta_id: int, ingrediente_id: int | None) -> None:
-    """Asigna la bolsa (un ítem de stock, normalmente un insumo en 'unidad')
+    """Asigna la bolsa (un insumo de categoría 'empaque', en 'unidad')
     que usa esta receta, 1 por unidad vendida; su precio pasa a ser el costo
     de empaque de la receta y se descuenta del stock con cada pedido. Con
     None se quita y vuelve a aplicar el empaque fijo de Costos indirectos."""
@@ -112,12 +112,16 @@ def actualizar_empaque(receta_id: int, ingrediente_id: int | None) -> None:
     try:
         cursor = conn.cursor()
         if ingrediente_id is not None:
-            cursor.execute("SELECT unidad_base FROM ingredientes WHERE id = %s", (ingrediente_id,))
+            cursor.execute(
+                "SELECT unidad_base, tipo, categoria FROM ingredientes WHERE id = %s", (ingrediente_id,)
+            )
             fila = cursor.fetchone()
             if fila is None:
                 raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
+            if fila["tipo"] != "insumo" or fila["categoria"] != "empaque":
+                raise ValueError("El empaque debe ser un insumo de categoría 'empaque' (se configura en Stock → Configurar)")
             if fila["unidad_base"] != "unidad":
-                raise ValueError("La bolsa debe ser un ítem en 'unidad' (se usa 1 por pan vendido)")
+                raise ValueError("El empaque debe estar en 'unidad' (se usa 1 por pan vendido)")
         cursor.execute(
             "UPDATE recetas SET empaque_ingrediente_id = %s WHERE id = %s",
             (ingrediente_id, receta_id),

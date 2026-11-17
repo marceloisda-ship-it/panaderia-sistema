@@ -366,10 +366,16 @@ Detalle de lo conversado, para cuando llegue su turno:
 - [ ] Más adelante: anticipar faltantes según los pedidos confirmados
       de la semana.
 - **Definido (2026-11-13)**:
-  - **Insumos**: sí se incluyen. Son ítems de la misma tabla que los
-    ingredientes, con `tipo = 'insumo'` y unidad `unidad`. Cada modelo de
-    bolsa (papel, plástica, otra) es un ítem propio. Hoy no hay cajas;
-    si aparecen, se agregan igual como un ítem más.
+  - **Ingredientes vs. insumos** *(corregido 2026-11-17)*: un
+    **ingrediente** es solo lo que lleva el pan. Un **insumo** es todo lo
+    demás que se compra y se gasta, con una **categoría**: `empaque`
+    (bolsas, cajas, etiquetas), `papel` (mantequilla…), `proteccion`
+    (guantes, cofias), `limpieza` u `otro`. Viven en la misma tabla
+    (`tipo` + `categoria`). Cada modelo de bolsa (papel, plástica…) es un
+    ítem propio de categoría `empaque`, en unidad `unidad`. Las recetas
+    solo ofrecen ingredientes para su fórmula y empaques para su bolsa.
+    Aún no se descuentan insumos que no sean el empaque (papel
+    mantequilla, guantes): solo se controlan por compras, conteo y merma.
   - **Compras**: se ingresan en el formato real (una botella de 500 ml,
     otra de 2000 ml, un saco de 1 kg, un pack de 100 bolsas) con
     cantidad, tamaño, unidad y precio de cada uno; el sistema convierte

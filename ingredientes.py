@@ -14,20 +14,52 @@ UNIDADES_VALIDAS = ("gr", "ml", "unidad")
 
 
 TIPOS_VALIDOS = ("ingrediente", "insumo")
+# Ingrediente = lo que lleva el pan. Insumo = todo lo demás que se compra y
+# se gasta (empaque, papel mantequilla, guantes, limpieza…), con categoría.
+# Solo los insumos de categoría 'empaque' se asignan a las recetas como bolsa.
+CATEGORIAS_INSUMO = ("empaque", "papel", "proteccion", "limpieza", "otro")
+ETIQUETAS_CATEGORIA = {
+    "empaque": "Empaque (bolsas, cajas, etiquetas)",
+    "papel": "Papel (mantequilla, etc.)",
+    "proteccion": "Protección (guantes, cofias)",
+    "limpieza": "Limpieza",
+    "otro": "Otro",
+}
+
+
+def normalizar_categoria(tipo: str, categoria: str | None) -> str | None:
+    """Valida el par tipo/categoría: un ingrediente no lleva categoría y un
+    insumo siempre (si no se indica, 'otro')."""
+    if tipo not in TIPOS_VALIDOS:
+        raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
+    if tipo == "ingrediente":
+        return None
+    categoria = categoria or "otro"
+    if categoria not in CATEGORIAS_INSUMO:
+        raise ValueError(f"categoria debe ser una de {CATEGORIAS_INSUMO}")
+    return categoria
+
+
+def etiqueta_tipo(item: dict) -> str:
+    """Texto corto para tablas: 'Ingrediente' o 'Insumo · Empaque'."""
+    if item["tipo"] == "ingrediente":
+        return "Ingrediente"
+    return f"Insumo · {(item.get('categoria') or 'otro').capitalize()}"
 
 
 def agregar_ingrediente(nombre: str, unidad_base: str, precio_actual: float,
                          proveedor: str | None = None, tipo: str = "ingrediente",
-                         stock_minimo: float = 0) -> int:
-    """Registra un nuevo ingrediente (o insumo: bolsa, caja, etiqueta) y
+                         stock_minimo: float = 0, categoria: str | None = None) -> int:
+    """Registra un nuevo ingrediente (o insumo: empaque, papel, guantes…) y
     guarda su primer precio en el historial.
 
     Retorna el id del ingrediente creado.
     """
     if unidad_base not in UNIDADES_VALIDAS:
         raise ValueError(f"unidad_base debe ser una de {UNIDADES_VALIDAS}")
-    if tipo not in TIPOS_VALIDOS:
-        raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
+    categoria = normalizar_categoria(tipo, categoria)
+    if tipo == "insumo" and categoria == "empaque" and unidad_base != "unidad":
+        raise ValueError("Un empaque debe estar en 'unidad' (se usa 1 por pan vendido)")
     if precio_actual < 0:
         raise ValueError("El precio no puede ser negativo")
     if stock_minimo < 0:
@@ -39,10 +71,11 @@ def agregar_ingrediente(nombre: str, unidad_base: str, precio_actual: float,
         cursor = conn.cursor()
         cursor.execute(
             """INSERT INTO ingredientes
-                   (nombre, unidad_base, precio_actual, proveedor, fecha_actualizacion, tipo, stock_minimo)
-               VALUES (%s, %s, %s, %s, %s, %s, %s)
+                   (nombre, unidad_base, precio_actual, proveedor, fecha_actualizacion, tipo, stock_minimo,
+                    categoria)
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                RETURNING id""",
-            (nombre, unidad_base, precio_actual, proveedor, fecha, tipo, stock_minimo),
+            (nombre, unidad_base, precio_actual, proveedor, fecha, tipo, stock_minimo, categoria),
         )
         ingrediente_id = cursor.fetchone()["id"]
         cursor.execute(

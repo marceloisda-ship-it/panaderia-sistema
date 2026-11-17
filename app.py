@@ -59,13 +59,20 @@ def mostrar_error(e: Exception):
     st.error(f"Error: {e}")
 
 
-def selector_ingrediente(label: str, key: str):
-    """Devuelve (id, dict) del ingrediente elegido en un selectbox, o (None, None)."""
+def selector_ingrediente(label: str, key: str, solo_tipo: str | None = None):
+    """Devuelve (id, dict) del ingrediente elegido en un selectbox, o (None, None).
+    `solo_tipo` ('ingrediente' o 'insumo') limita la lista; los insumos
+    se distinguen en la etiqueta por su categoría."""
     ings = mod_ing.listar_ingredientes()
+    if solo_tipo:
+        ings = [i for i in ings if i["tipo"] == solo_tipo]
     if not ings:
-        st.info("No hay ingredientes registrados todavía.")
+        st.info("No hay ítems de este tipo registrados todavía.")
         return None, None
-    opciones = {f"{i['nombre']} (#{i['id']})": i for i in ings}
+    opciones = {
+        f"{i['nombre']} (#{i['id']})" + ("" if i["tipo"] == "ingrediente" else f" · {mod_ing.etiqueta_tipo(i)}"): i
+        for i in ings
+    }
     elegido = st.selectbox(label, list(opciones.keys()), key=key)
     ing = opciones[elegido]
     return ing["id"], ing
@@ -142,8 +149,30 @@ def _aplicar_filtro_pedidos(opcion: str):
 
 # --- Sección: Ingredientes ------------------------------------------------
 
+def selector_tipo_categoria(key: str, tipo_actual: str = "ingrediente", categoria_actual: str | None = None):
+    """Elige 'Ingrediente' o 'Insumo' y, solo para insumos, su categoría.
+    Va FUERA de los st.form a propósito: dentro de un form la categoría no
+    podría aparecer/desaparecer al cambiar el tipo. Retorna (tipo, categoria)."""
+    tipos = list(mod_ing.TIPOS_VALIDOS)
+    tipo = st.radio(
+        "Tipo", tipos, index=tipos.index(tipo_actual), horizontal=True, key=f"{key}_tipo",
+        format_func=lambda t: "Ingrediente (va en la receta del pan)" if t == "ingrediente"
+        else "Insumo (empaque, papel, guantes, limpieza…)",
+    )
+    if tipo == "ingrediente":
+        return tipo, None
+    cats = list(mod_ing.CATEGORIAS_INSUMO)
+    categoria = st.selectbox(
+        "Categoría del insumo", cats,
+        index=cats.index(categoria_actual) if categoria_actual in cats else 0,
+        format_func=lambda c: mod_ing.ETIQUETAS_CATEGORIA[c], key=f"{key}_categoria",
+        help="Solo los de categoría Empaque se pueden asignar a una receta como bolsa.",
+    )
+    return tipo, categoria
+
+
 def seccion_ingredientes():
-    st.header("🧂 Ingredientes")
+    st.header("🧂 Ingredientes e insumos")
     # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
     # pestañas en cada interacción, y contra Supabase eso son consultas de
     # más por click. Con este selector solo corre la sección activa.
@@ -160,37 +189,46 @@ def seccion_ingredientes():
         if not ings:
             st.info("No hay ingredientes cargados todavía.")
         else:
-            busqueda = st.text_input("Buscar por nombre", key="buscar_ingrediente")
+            col_t, col_b = st.columns([1, 2])
+            filtro_tipo = col_t.selectbox("Mostrar", ["Todos", "Ingredientes", "Insumos"], key="filtro_tipo_ing")
+            busqueda = col_b.text_input("Buscar por nombre", key="buscar_ingrediente")
+            if filtro_tipo != "Todos":
+                tipo_f = "ingrediente" if filtro_tipo == "Ingredientes" else "insumo"
+                ings = [i for i in ings if i["tipo"] == tipo_f]
             if busqueda.strip():
                 ings = [i for i in ings if busqueda.strip().lower() in i["nombre"].lower()]
             if not ings:
-                st.info("Ningún ingrediente coincide con la búsqueda.")
+                st.info("Ningún ítem coincide con los filtros.")
             else:
-                df = pd.DataFrame(ings)[
+                df = pd.DataFrame([{**i, "tipo": mod_ing.etiqueta_tipo(i)} for i in ings])[
                     ["id", "nombre", "tipo", "unidad_base", "precio_actual", "proveedor", "fecha_actualizacion"]
                 ]
                 st.dataframe(df, width='stretch', hide_index=True)
 
     elif vista == "Agregar":
+        tipo, categoria = selector_tipo_categoria("agregar_ing")
+        es_empaque = categoria == "empaque"
+        if es_empaque:
+            st.caption("Un empaque va en 'unidad' (1 por pan vendido). Cada modelo —papel, plástica, otra— es un ítem aparte.")
         with st.form("form_agregar_ingrediente", clear_on_submit=True):
-            nombre = st.text_input("Nombre (ej. Harina 000)")
-            unidad = st.selectbox("Unidad base", ["gr", "ml", "unidad"])
-            precio = st.number_input("Precio actual", min_value=0.0, step=1.0)
-            proveedor = st.text_input("Proveedor (opcional)")
-            tipo = st.selectbox(
-                "Tipo", list(mod_ing.TIPOS_VALIDOS),
-                help="Insumo = bolsas, cajas, etiquetas. Cada modelo de bolsa es un ítem aparte, en 'unidad'.",
+            nombre = st.text_input(
+                "Nombre", placeholder="Ej. Harina 000" if tipo == "ingrediente" else "Ej. Bolsa de papel kraft",
             )
+            unidades = ["gr", "ml", "unidad"]
+            unidad = st.selectbox("Unidad base", unidades, index=2 if es_empaque else 0)
+            precio = st.number_input("Precio actual (por unidad base)", min_value=0.0, step=1.0)
+            proveedor = st.text_input("Proveedor (opcional)")
             minimo = st.number_input(
                 "Stock mínimo (en la unidad base; 0 = sin aviso)", min_value=0.0, step=1.0
             )
-            enviado = st.form_submit_button("Guardar ingrediente")
+            enviado = st.form_submit_button("Guardar")
         if enviado:
             try:
                 ing_id = mod_ing.agregar_ingrediente(
-                    nombre, unidad, precio, proveedor or None, tipo=tipo, stock_minimo=minimo
+                    nombre, unidad, precio, proveedor or None, tipo=tipo, stock_minimo=minimo,
+                    categoria=categoria,
                 )
-                st.success(f"Ingrediente creado con id {ing_id}")
+                st.success(f"{'Ingrediente' if tipo == 'ingrediente' else 'Insumo'} creado con id {ing_id}")
             except Exception as e:
                 mostrar_error(e)
 
@@ -298,14 +336,15 @@ def seccion_stock():
             st.info("No hay ingredientes ni insumos cargados todavía.")
             return
         col_t, col_e, col_b = st.columns([1, 1, 2])
-        tipo = col_t.selectbox("Tipo", ["Todos", "ingrediente", "insumo"], key="stock_filtro_tipo")
+        tipo = col_t.selectbox("Tipo", ["Todos", "Ingredientes", "Insumos"], key="stock_filtro_tipo")
         estado = col_e.selectbox(
             "Estado", ["Todos"] + [mod_stock.ETIQUETAS_ESTADO_STOCK[e] for e in mod_stock.ESTADOS_STOCK],
             key="stock_filtro_estado",
         )
         busqueda = col_b.text_input("Buscar por nombre", key="stock_buscar")
         if tipo != "Todos":
-            items = [i for i in items if i["tipo"] == tipo]
+            tipo_f = "ingrediente" if tipo == "Ingredientes" else "insumo"
+            items = [i for i in items if i["tipo"] == tipo_f]
         if estado != "Todos":
             items = [i for i in items if mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]] == estado]
         if busqueda.strip():
@@ -324,7 +363,7 @@ def seccion_stock():
                 {
                     "Estado": mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]],
                     "Ítem": i["nombre"],
-                    "Tipo": i["tipo"],
+                    "Tipo": mod_ing.etiqueta_tipo(i),
                     "Stock": _fmt_cantidad(i["stock_actual"], i["unidad_base"]),
                     "Mínimo": _fmt_cantidad(i["stock_minimo"], i["unidad_base"]),
                     "Proveedor": i["proveedor"] or "—",
@@ -450,9 +489,11 @@ def seccion_stock():
     elif vista == "Configurar":
         ing_id, ing = selector_ingrediente("Ítem", "stock_sel_config")
         if ing_id is not None:
+            st.caption(f"Actual: {mod_ing.etiqueta_tipo(ing)}")
+            tipo, categoria = selector_tipo_categoria(
+                f"config_stock_{ing_id}", ing["tipo"], ing.get("categoria")
+            )
             with st.form(f"form_config_stock_{ing_id}"):
-                tipos = list(mod_ing.TIPOS_VALIDOS)
-                tipo = st.selectbox("Tipo", tipos, index=tipos.index(ing["tipo"]))
                 minimo = st.number_input(
                     f"Stock mínimo ({ing['unidad_base']}; 0 = sin aviso)",
                     min_value=0.0, step=1.0, value=float(ing["stock_minimo"]),
@@ -460,7 +501,7 @@ def seccion_stock():
                 enviado = st.form_submit_button("Guardar")
             if enviado:
                 try:
-                    mod_stock.configurar_item(ing_id, tipo, minimo)
+                    mod_stock.configurar_item(ing_id, tipo, minimo, categoria)
                     st.success("Configuración guardada.")
                     st.rerun()
                 except Exception as e:
@@ -566,7 +607,7 @@ def seccion_recetas():
                 st.info("Esta receta todavía no tiene ingredientes.")
 
             st.subheader("Agregar o actualizar cantidad")
-            ing_id, ing = selector_ingrediente("Ingrediente", "sel_ing_para_receta")
+            ing_id, ing = selector_ingrediente("Ingrediente", "sel_ing_para_receta", solo_tipo="ingrediente")
             if ing_id is not None:
                 unidad = ing["unidad_base"]
                 with st.form("form_agregar_ing_receta"):
@@ -653,7 +694,10 @@ def seccion_recetas():
                 st.info("Esta receta todavía no tiene ingredientes.")
 
             st.subheader("Empaque de esta receta")
-            bolsas = [i for i in mod_ing.listar_ingredientes() if i["unidad_base"] == "unidad"]
+            bolsas = [
+                i for i in mod_ing.listar_ingredientes()
+                if i["tipo"] == "insumo" and i.get("categoria") == "empaque"
+            ]
             if d["empaque_ingrediente_id"] is not None:
                 st.caption(f"Actual: {d['empaque_nombre']} (${d['costo_empaque']:.2f} por unidad vendida)")
             else:
@@ -662,7 +706,10 @@ def seccion_recetas():
                     f"(${d['costo_empaque']:.2f} por unidad vendida)."
                 )
             if not bolsas:
-                st.info("Aún no hay ítems en 'unidad'. Agrega las bolsas en Ingredientes (tipo insumo, unidad 'unidad').")
+                st.info(
+                    "Aún no hay empaques. Agrégalos en Ingredientes → Agregar "
+                    "(Tipo: Insumo, Categoría: Empaque) y vuelve aquí."
+                )
             else:
                 sin_bolsa = "(sin bolsa: usar empaque fijo)"
                 opciones_bolsa = {sin_bolsa: None}

@@ -21,7 +21,7 @@ import uuid
 # de la inicialización: Streamlit Cloud, al recibir un push, recarga el
 # código sin reiniciar el proceso, y sin esta clave el caché viejo hacía
 # que la migración nueva nunca corriera (pasó el 2026-11-04).
-VERSION_ESQUEMA = 4
+VERSION_ESQUEMA = 5
 
 import streamlit as st
 import psycopg2
@@ -386,6 +386,22 @@ def inicializar_db() -> None:
         ALTER TABLE movimientos_stock ADD COLUMN IF NOT EXISTS pedido_id INTEGER
             REFERENCES pedidos(id) ON DELETE SET NULL;
         CREATE INDEX IF NOT EXISTS idx_movimientos_stock_pedido ON movimientos_stock (pedido_id);
+    """)
+
+    # `ingredientes.categoria`: solo para tipo 'insumo' (empaque, papel,
+    # proteccion, limpieza, otro; ver ingredientes.CATEGORIAS_INSUMO). Un
+    # ingrediente no tiene categoría. Las recetas solo ofrecen como bolsa los
+    # insumos de categoría 'empaque'. Migración de lo cargado en la v4: los
+    # insumos que ya eran la bolsa de alguna receta, o que se llaman
+    # bolsa/caja/empaque, pasan a 'empaque'; el resto de insumos a 'otro'
+    # (se corrige en Stock → Configurar). Idempotente: solo toca categoria NULL.
+    sentencias.append("""
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS categoria TEXT;
+        UPDATE ingredientes SET categoria = 'empaque'
+            WHERE tipo = 'insumo' AND categoria IS NULL
+              AND (id IN (SELECT empaque_ingrediente_id FROM recetas WHERE empaque_ingrediente_id IS NOT NULL)
+                   OR nombre ILIKE '%bolsa%' OR nombre ILIKE '%caja%' OR nombre ILIKE '%empaque%');
+        UPDATE ingredientes SET categoria = 'otro' WHERE tipo = 'insumo' AND categoria IS NULL;
     """)
 
     # --- Módulo de Cobranza ---------------------------------------------------
