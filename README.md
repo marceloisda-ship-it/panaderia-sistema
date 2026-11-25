@@ -529,6 +529,33 @@ Etapas 3 y 4** (sección Pasos a seguir) y seguir con la Etapa 3.
   ajustar) y los mínimos; luego anticipar faltantes según los pedidos
   confirmados de la semana.
 
+### 2026-11-17 — Ingredientes vs. insumos (esquema v5)
+
+Tras probar Stock, el usuario reportó que no podía ingresar el empaque:
+"insumo" era solo una etiqueta, sin categorías, y el selector de bolsa de
+las recetas mezclaba cualquier ítem en `unidad`.
+
+- **Modelo**: ingrediente = lo que lleva el pan; insumo = todo lo demás,
+  con `categoria` (`empaque`, `papel`, `proteccion`, `limpieza`, `otro`).
+  Columna nueva `ingredientes.categoria`; `VERSION_ESQUEMA = 5`.
+- **Pantalla**: selector Tipo/Categoría en Ingredientes → Agregar y en
+  Stock → Configurar; filtro Todos/Ingredientes/Insumos y etiquetas
+  ("Insumo · Empaque"); las recetas ofrecen solo ingredientes para la
+  fórmula y solo empaques para la bolsa.
+- **Migración v5**: los insumos que ya eran bolsa de una receta, o cuyo
+  nombre contiene bolsa/caja/empaque, pasan a `empaque`; el resto a `otro`.
+- **Incidente**: el primer despliegue de la v5 dejó la app caída
+  (`IndexError` al arrancar) porque el SQL tenía `ILIKE '%bolsa%'` y
+  psycopg2 toma cada `%` como parámetro. Se corrigió con
+  `strpos(lower(nombre), …)` (commit `5964eec`). La migración corre en
+  una sola transacción, así que al fallar no se aplicó nada.
+- **Commits**: `e1441c1` (categorías) y `5964eec` (corrección).
+- **Pendiente**: confirmar que la app arranca con la v5 (puede requerir
+  "Reboot app"); el **respaldo de Supabase** sigue sin hacerse para las
+  migraciones v4 y v5 (la red del PC de desarrollo bloquea Supabase);
+  recibir el resto del feedback del usuario sobre Stock; insumos que no
+  son empaque (papel mantequilla, guantes) aún no se descuentan por pan.
+
 ### Notas técnicas para retomar
 
 - **Cambios de esquema**: `db.inicializar_db()` crea las tablas y aplica
@@ -540,6 +567,12 @@ Etapas 3 y 4** (sección Pasos a seguir) y seguir con la Etapa 3.
   fecha_entregado` y hubo que aplicar la migración a mano).
 - **Antes de migrar**: respaldar y ensayar el SQL contra Supabase dentro
   de `BEGIN … ROLLBACK`.
+- **SQL de `inicializar_db()`**: no usar `%` literal (ej. `LIKE '%x%'`):
+  `conn.execute` siempre pasa parámetros y psycopg2 lo toma como
+  marcador (`IndexError`). Usar `strpos()` o escribir `%%`.
+- **Reiniciar tras migrar**: además de subir `VERSION_ESQUEMA`, hacer
+  "Reboot app" en Streamlit Cloud; si no, el proceso conserva el `db.py`
+  viejo (pasó el 2026-11-13: `UndefinedTable` en `movimientos_stock`).
 - **PC de desarrollo**: el Control de aplicaciones de Windows bloquea las
   DLL de `psycopg2` y `pandas`, así que la app **no corre localmente**
   (ni con `streamlit run` ni con `AppTest`). Para revisar el código se

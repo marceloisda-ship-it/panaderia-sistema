@@ -26,9 +26,10 @@ resume dónde quedó la última sesión y lo que no es obvio en el código.
   el empaque (ingrediente/insumo mal modelado). Se agregó
   `ingredientes.categoria` (esquema **v5**), selector Tipo/Categoría en
   Ingredientes → Agregar y Stock → Configurar, y filtros en recetas.
-  **Sin commitear ni desplegar todavía** (cambios locales; requiere push
-  + "Reboot app"). Quedan por recibir más puntos de su feedback ("1." era
-  el primero).
+  Desplegado en `e1441c1`; la primera carga cayó con `IndexError` por un
+  `%` en el SQL de migración, corregido y subido en `5964eec`. Falta
+  confirmar con el usuario que la app arranca (si no, "Reboot app").
+  Quedan por recibir más puntos de su feedback ("1." era el primero).
 - El usuario va a revisar la funcionalidad y dar retroalimentación. La
   lista de pruebas (13 puntos) se dio en el chat; resumen: Stock (resumen,
   compra, conteo/merma, por reponer, movimientos, configurar), bolsa por
