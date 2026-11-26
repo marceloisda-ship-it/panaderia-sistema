@@ -9,13 +9,16 @@ Para ejecutar:
     streamlit run app.py
 """
 
-from datetime import date
+import calendar
+from datetime import date, timedelta
 
 import pandas as pd
 import streamlit as st
 
-from db import inicializar_db
+from db import inicializar_db, VERSION_ESQUEMA
+import auth
 import ingredientes as mod_ing
+import stock as mod_stock
 import recetas as mod_rec
 import caja as mod_caja
 import costos_indirectos as mod_costos
@@ -25,7 +28,29 @@ import clientes as mod_clientes
 import dashboard as mod_dash
 
 st.set_page_config(page_title="Panadería · Gestión", page_icon="🥖", layout="wide")
-inicializar_db()
+
+if not st.session_state.get("usuario"):
+    auth.mostrar_login()
+    st.stop()
+
+
+@st.cache_resource
+def _inicializar_db_una_vez(version_esquema: int):
+    # Streamlit vuelve a ejecutar todo este script en cada interacción
+    # (incluido cambiar de pestaña en el sidebar) — sin este cache,
+    # inicializar_db() mandaría ~14 sentencias SQL (crear las 11 tablas +
+    # 3 inserts de configuración) contra Supabase en cada click, aunque
+    # el esquema ya exista (~2s de más por navegación). Con @st.cache_resource
+    # corre una sola vez por proceso, no una vez por rerun.
+    #
+    # `version_esquema` es la clave del caché: al subir VERSION_ESQUEMA en
+    # db.py vuelve a correr aunque Streamlit Cloud no reinicie el proceso
+    # tras un push (que solo recarga el código y conserva el caché).
+    inicializar_db()
+    return True
+
+
+_inicializar_db_una_vez(VERSION_ESQUEMA)
 
 
 # --- Helpers comunes -----------------------------------------------------
@@ -34,20 +59,27 @@ def mostrar_error(e: Exception):
     st.error(f"Error: {e}")
 
 
-def selector_ingrediente(label: str, key: str):
-    """Devuelve (id, dict) del ingrediente elegido en un selectbox, o (None, None)."""
+def selector_ingrediente(label: str, key: str, solo_tipo: str | None = None):
+    """Devuelve (id, dict) del ingrediente elegido en un selectbox, o (None, None).
+    `solo_tipo` ('ingrediente' o 'insumo') limita la lista; los insumos
+    se distinguen en la etiqueta por su categoría."""
     ings = mod_ing.listar_ingredientes()
+    if solo_tipo:
+        ings = [i for i in ings if i["tipo"] == solo_tipo]
     if not ings:
-        st.info("No hay ingredientes registrados todavía.")
+        st.info("No hay ítems de este tipo registrados todavía.")
         return None, None
-    opciones = {f"{i['nombre']} (#{i['id']})": i for i in ings}
+    opciones = {
+        f"{i['nombre']} (#{i['id']})" + ("" if i["tipo"] == "ingrediente" else f" · {mod_ing.etiqueta_tipo(i)}"): i
+        for i in ings
+    }
     elegido = st.selectbox(label, list(opciones.keys()), key=key)
     ing = opciones[elegido]
     return ing["id"], ing
 
 
 def selector_receta(label: str, key: str, solo_activas: bool = False):
-    recetas = mod_rec.listar_recetas(solo_activas=solo_activas)
+    recetas = mod_rec.listar_recetas_resumen(solo_activas=solo_activas)
     if not recetas:
         st.info("No hay recetas registradas todavía.")
         return None
@@ -66,58 +98,141 @@ def selector_cliente(label: str, key: str):
     return opciones[elegido]
 
 
-def selector_pedido(label: str, key: str, estado: str | None = None):
-    pedidos = mod_pedidos.listar_pedidos(estado=estado)
+def selector_pedido(label: str, key: str, estado: str | None = None, filtro=None):
+    """`filtro` (opcional) recibe cada pedido resumido y decide si se
+    muestra, para filtros que no son un solo estado (ej. "por cobrar")."""
+    pedidos = mod_pedidos.listar_pedidos_resumen(estado=estado)
+    if filtro is not None:
+        pedidos = [p for p in pedidos if filtro(p)]
     if not pedidos:
         st.info("No hay pedidos para mostrar.")
         return None
     opciones = {
-        f"#{p['id']} · {p['cliente_nombre']} · entrega {p['fecha_entrega']} · {p['estado']}": p["id"]
+        f"#{p['id']} · {p['cliente_nombre']} · entrega {p['fecha_entrega']} · "
+        f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}": p["id"]
         for p in pedidos
     }
     elegido = st.selectbox(label, list(opciones.keys()), key=key)
     return opciones[elegido]
 
 
+def _marca_pago(p: dict) -> str:
+    """Sufijo para títulos de pedidos: pagado, o por cobrar si ya se
+    entregó sin pago."""
+    if p["pagado"]:
+        return " · pagado"
+    if p["estado"] == "entregado":
+        return " · por cobrar"
+    return ""
+
+
+def _es_por_cobrar(p: dict) -> bool:
+    return p["estado"] == "entregado" and not p["pagado"]
+
+
+# Estados que se pueden elegir en el filtro de Agenda y Línea de producción, en el
+# orden del flujo. Los cancelados y los por cobrar no van aquí (los por
+# cobrar tienen su propia vista).
+_ESTADOS_FILTRO = ("recibido", "confirmado", "en_produccion", "listo", "entregado")
+
+
+def _opciones_filtro_pedidos() -> list[str]:
+    return [mod_pedidos.etiqueta_estado(e) for e in _ESTADOS_FILTRO]
+
+
+def _aplicar_filtro_pedidos(opcion: str):
+    """Traduce una opción de `_opciones_filtro_pedidos` a (estado, filtro)
+    para `listar_pedidos` / `selector_pedido`."""
+    estado = next(e for e in _ESTADOS_FILTRO if mod_pedidos.etiqueta_estado(e) == opcion)
+    return estado, None
+
+
 # --- Sección: Ingredientes ------------------------------------------------
 
+def selector_tipo_categoria(key: str, tipo_actual: str = "ingrediente", categoria_actual: str | None = None):
+    """Elige 'Ingrediente' o 'Insumo' y, solo para insumos, su categoría.
+    Va FUERA de los st.form a propósito: dentro de un form la categoría no
+    podría aparecer/desaparecer al cambiar el tipo. Retorna (tipo, categoria)."""
+    tipos = list(mod_ing.TIPOS_VALIDOS)
+    tipo = st.radio(
+        "Tipo", tipos, index=tipos.index(tipo_actual), horizontal=True, key=f"{key}_tipo",
+        format_func=lambda t: "Ingrediente (va en la receta del pan)" if t == "ingrediente"
+        else "Insumo (empaque, papel, guantes, limpieza…)",
+    )
+    if tipo == "ingrediente":
+        return tipo, None
+    cats = list(mod_ing.CATEGORIAS_INSUMO)
+    categoria = st.selectbox(
+        "Categoría del insumo", cats,
+        index=cats.index(categoria_actual) if categoria_actual in cats else 0,
+        format_func=lambda c: mod_ing.ETIQUETAS_CATEGORIA[c], key=f"{key}_categoria",
+        help="Solo los de categoría Empaque se pueden asignar a una receta como bolsa.",
+    )
+    return tipo, categoria
+
+
 def seccion_ingredientes():
-    st.header("🧂 Ingredientes")
-    tab_listado, tab_agregar, tab_precio, tab_historial, tab_eliminar = st.tabs(
-        ["Listado", "Agregar", "Actualizar precio", "Historial de precio", "Eliminar"]
+    st.header("🧂 Ingredientes e insumos")
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Listado", "Agregar", "Actualizar precio", "Historial de precio", "Eliminar"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_ingredientes",
     )
 
-    with tab_listado:
+    if vista == "Listado":
         ings = mod_ing.listar_ingredientes()
         if not ings:
             st.info("No hay ingredientes cargados todavía.")
         else:
-            busqueda = st.text_input("Buscar por nombre", key="buscar_ingrediente")
+            col_t, col_b = st.columns([1, 2])
+            filtro_tipo = col_t.selectbox("Mostrar", ["Todos", "Ingredientes", "Insumos"], key="filtro_tipo_ing")
+            busqueda = col_b.text_input("Buscar por nombre", key="buscar_ingrediente")
+            if filtro_tipo != "Todos":
+                tipo_f = "ingrediente" if filtro_tipo == "Ingredientes" else "insumo"
+                ings = [i for i in ings if i["tipo"] == tipo_f]
             if busqueda.strip():
                 ings = [i for i in ings if busqueda.strip().lower() in i["nombre"].lower()]
             if not ings:
-                st.info("Ningún ingrediente coincide con la búsqueda.")
+                st.info("Ningún ítem coincide con los filtros.")
             else:
-                df = pd.DataFrame(ings)[
-                    ["id", "nombre", "unidad_base", "precio_actual", "proveedor", "fecha_actualizacion"]
+                df = pd.DataFrame([{**i, "tipo": mod_ing.etiqueta_tipo(i)} for i in ings])[
+                    ["id", "nombre", "tipo", "unidad_base", "precio_actual", "proveedor", "fecha_actualizacion"]
                 ]
                 st.dataframe(df, width='stretch', hide_index=True)
 
-    with tab_agregar:
+    elif vista == "Agregar":
+        tipo, categoria = selector_tipo_categoria("agregar_ing")
+        es_empaque = categoria == "empaque"
+        if es_empaque:
+            st.caption("Un empaque va en 'unidad' (1 por pan vendido). Cada modelo —papel, plástica, otra— es un ítem aparte.")
         with st.form("form_agregar_ingrediente", clear_on_submit=True):
-            nombre = st.text_input("Nombre (ej. Harina 000)")
-            unidad = st.selectbox("Unidad base", ["gr", "ml", "unidad"])
-            precio = st.number_input("Precio actual", min_value=0.0, step=1.0)
+            nombre = st.text_input(
+                "Nombre", placeholder="Ej. Harina 000" if tipo == "ingrediente" else "Ej. Bolsa de papel kraft",
+            )
+            unidades = ["gr", "ml", "unidad"]
+            unidad = st.selectbox("Unidad base", unidades, index=2 if es_empaque else 0)
+            precio = st.number_input("Precio actual (por unidad base)", min_value=0.0, step=1.0)
             proveedor = st.text_input("Proveedor (opcional)")
-            enviado = st.form_submit_button("Guardar ingrediente")
+            minimo = st.number_input(
+                "Stock mínimo (en la unidad base; 0 = sin aviso)", min_value=0.0, step=1.0
+            )
+            enviado = st.form_submit_button("Guardar")
         if enviado:
             try:
-                ing_id = mod_ing.agregar_ingrediente(nombre, unidad, precio, proveedor or None)
-                st.success(f"Ingrediente creado con id {ing_id}")
+                ing_id = mod_ing.agregar_ingrediente(
+                    nombre, unidad, precio, proveedor or None, tipo=tipo, stock_minimo=minimo,
+                    categoria=categoria,
+                )
+                st.success(f"{'Ingrediente' if tipo == 'ingrediente' else 'Insumo'} creado con id {ing_id}")
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_precio:
+    elif vista == "Actualizar precio":
         ing_id, ing = selector_ingrediente("Ingrediente a actualizar", "sel_precio")
         if ing_id is not None:
             st.caption(f"Precio actual: ${ing['precio_actual']:.2f} / {ing['unidad_base']}")
@@ -145,7 +260,7 @@ def seccion_ingredientes():
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_historial:
+    elif vista == "Historial de precio":
         ing_id, _ = selector_ingrediente("Ingrediente", "sel_historial")
         if ing_id is not None:
             historial = mod_ing.historial_de_precio(ing_id)
@@ -170,7 +285,7 @@ def seccion_ingredientes():
                     except Exception as e:
                         mostrar_error(e)
 
-    with tab_eliminar:
+    elif vista == "Eliminar":
         ing_id, ing = selector_ingrediente("Ingrediente a eliminar", "sel_eliminar_ing")
         if ing_id is not None:
             st.caption(
@@ -196,15 +311,219 @@ def seccion_ingredientes():
                         mostrar_error(e)
 
 
+# --- Sección: Stock ---------------------------------------------------------
+
+def _fmt_cantidad(valor: float, unidad: str) -> str:
+    """Cantidad con separador de miles '.' y decimales ',' (formato chileno)."""
+    decimales = 0 if abs(valor - round(valor)) < 1e-9 else 2
+    texto = f"{valor:,.{decimales}f}".replace(",", "X").replace(".", ",").replace("X", ".")
+    return f"{texto} {unidad}"
+
+
+def seccion_stock():
+    st.header("📦 Stock")
+    vista = st.radio(
+        "Sección",
+        ["Resumen", "Registrar compra", "Contar / ajustar", "Por reponer", "Movimientos", "Configurar"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_stock",
+    )
+
+    if vista == "Resumen":
+        items = mod_stock.listar_stock()
+        if not items:
+            st.info("No hay ingredientes ni insumos cargados todavía.")
+            return
+        col_t, col_e, col_b = st.columns([1, 1, 2])
+        tipo = col_t.selectbox("Tipo", ["Todos", "Ingredientes", "Insumos"], key="stock_filtro_tipo")
+        estado = col_e.selectbox(
+            "Estado", ["Todos"] + [mod_stock.ETIQUETAS_ESTADO_STOCK[e] for e in mod_stock.ESTADOS_STOCK],
+            key="stock_filtro_estado",
+        )
+        busqueda = col_b.text_input("Buscar por nombre", key="stock_buscar")
+        if tipo != "Todos":
+            tipo_f = "ingrediente" if tipo == "Ingredientes" else "insumo"
+            items = [i for i in items if i["tipo"] == tipo_f]
+        if estado != "Todos":
+            items = [i for i in items if mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]] == estado]
+        if busqueda.strip():
+            items = [i for i in items if busqueda.strip().lower() in i["nombre"].lower()]
+
+        todos = mod_stock.listar_stock()
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sin stock", sum(1 for i in todos if i["estado"] == "sin_stock"))
+        c2.metric("Queda poco", sum(1 for i in todos if i["estado"] == "queda_poco"))
+        c3.metric("Valor del stock", f"${sum(i['valor_stock'] for i in todos):,.0f}".replace(",", "."))
+
+        if not items:
+            st.info("Ningún ítem coincide con los filtros.")
+        else:
+            df = pd.DataFrame([
+                {
+                    "Estado": mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]],
+                    "Ítem": i["nombre"],
+                    "Tipo": mod_ing.etiqueta_tipo(i),
+                    "Stock": _fmt_cantidad(i["stock_actual"], i["unidad_base"]),
+                    "Mínimo": _fmt_cantidad(i["stock_minimo"], i["unidad_base"]),
+                    "Proveedor": i["proveedor"] or "—",
+                }
+                for i in items
+            ])
+            st.dataframe(df, width='stretch', hide_index=True)
+
+    elif vista == "Registrar compra":
+        ing_id, ing = selector_ingrediente("Ítem comprado", "stock_sel_compra")
+        if ing_id is not None:
+            base = ing["unidad_base"]
+            st.caption(
+                f"Se ingresa en el formato en que lo compraste; el sistema lo pasa a {base}. "
+                f"Precio actual: ${ing['precio_actual']:.4f} / {base}"
+            )
+            with st.form("form_registrar_compra", clear_on_submit=True):
+                c1, c2, c3 = st.columns(3)
+                cantidad = c1.number_input("Cuántos compraste", min_value=1.0, value=1.0, step=1.0)
+                tamano = c2.number_input("Tamaño de cada uno", min_value=0.0, step=1.0,
+                                         help="Ej. 500 (botella de 500 ml), 25 (saco de 25 kg), 100 (pack de 100 bolsas)")
+                unidad_fmt = c3.selectbox("Unidad del tamaño", list(mod_stock.UNIDADES_FORMATO[base]))
+                precio = st.number_input("Precio de cada uno", min_value=0.0, step=100.0)
+                proveedor = st.text_input("Proveedor (opcional)", value=ing["proveedor"] or "")
+                nota = st.text_input("Nota (opcional)")
+                enviado = st.form_submit_button("Registrar compra")
+            if enviado:
+                try:
+                    r = mod_stock.registrar_compra(
+                        ing_id, cantidad, tamano, unidad_fmt, precio, proveedor or None, nota or None
+                    )
+                    st.success(
+                        f"Compra registrada: +{_fmt_cantidad(r['cantidad_base'], base)} · "
+                        f"${r['precio_por_unidad_base']:.4f} / {base} · "
+                        f"stock ahora {_fmt_cantidad(r['stock_actual'], base)}"
+                    )
+                except Exception as e:
+                    mostrar_error(e)
+
+    elif vista == "Contar / ajustar":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_ajuste")
+        if ing_id is not None:
+            base = ing["unidad_base"]
+            actual = next(i["stock_actual"] for i in mod_stock.listar_stock() if i["id"] == ing_id)
+            st.caption(f"Stock en el sistema: {_fmt_cantidad(actual, base)}")
+
+            st.subheader("Conteo físico")
+            st.caption("Escribe lo que realmente hay: el sistema registra la diferencia. También sirve para cargar el stock inicial.")
+            with st.form("form_conteo", clear_on_submit=True):
+                real = st.number_input(f"Cantidad real ({base})", min_value=0.0, step=1.0)
+                nota = st.text_input("Nota (opcional)", key="nota_conteo")
+                enviado = st.form_submit_button("Aplicar conteo")
+            if enviado:
+                try:
+                    dif = mod_stock.registrar_conteo(ing_id, real, nota or None)
+                    st.success("El conteo coincide con el sistema." if dif == 0
+                               else f"Ajuste registrado: {dif:+,.2f} {base}")
+                except Exception as e:
+                    mostrar_error(e)
+
+            st.divider()
+            st.subheader("Merma")
+            with st.form("form_merma", clear_on_submit=True):
+                perdida = st.number_input(f"Cantidad perdida ({base})", min_value=0.0, step=1.0)
+                nota_m = st.text_input("Motivo (opcional)", key="nota_merma")
+                enviado_m = st.form_submit_button("Registrar merma")
+            if enviado_m:
+                try:
+                    mod_stock.registrar_merma(ing_id, perdida, nota_m or None)
+                    st.success("Merma registrada.")
+                except Exception as e:
+                    mostrar_error(e)
+
+    elif vista == "Por reponer":
+        pendientes = mod_stock.listar_por_reponer()
+        if not pendientes:
+            st.success("Nada por reponer: todo lo que tiene mínimo definido está sobre ese mínimo.")
+            return
+        st.caption(
+            "Cantidad = lo que falta para volver al mínimo; costo según el último precio. "
+            "Solo aparecen ítems con mínimo definido (pestaña Configurar)."
+        )
+        grupos: dict[str, list[dict]] = {}
+        for p in pendientes:
+            grupos.setdefault(p["proveedor"] or "Sin proveedor", []).append(p)
+        total = 0.0
+        for proveedor in sorted(grupos):
+            items = grupos[proveedor]
+            subtotal = sum(i["costo_estimado"] for i in items)
+            total += subtotal
+            st.subheader(f"{proveedor} · ${subtotal:,.0f}".replace(",", "."))
+            st.dataframe(pd.DataFrame([
+                {
+                    "Estado": mod_stock.ETIQUETAS_ESTADO_STOCK[i["estado"]],
+                    "Ítem": i["nombre"],
+                    "Stock": _fmt_cantidad(i["stock_actual"], i["unidad_base"]),
+                    "Falta": _fmt_cantidad(i["faltante"], i["unidad_base"]),
+                    "Costo estimado": f"${i['costo_estimado']:,.0f}".replace(",", "."),
+                }
+                for i in items
+            ]), width='stretch', hide_index=True)
+        st.metric("Costo estimado total", f"${total:,.0f}".replace(",", "."))
+
+    elif vista == "Movimientos":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_mov")
+        if ing_id is not None:
+            movs = mod_stock.listar_movimientos(ing_id)
+            if not movs:
+                st.info("Sin movimientos todavía.")
+            else:
+                st.dataframe(pd.DataFrame([
+                    {
+                        "Fecha": m["fecha"],
+                        "Tipo": m["tipo"],
+                        "Cantidad": _fmt_cantidad(m["cantidad"], ing["unidad_base"]),
+                        "Formato": m["formato"] or "",
+                        "Pagado": f"${m['precio_total']:,.0f}".replace(",", ".") if m["precio_total"] is not None else "",
+                        "Nota": m["nota"] or "",
+                    }
+                    for m in movs
+                ]), width='stretch', hide_index=True)
+
+    elif vista == "Configurar":
+        ing_id, ing = selector_ingrediente("Ítem", "stock_sel_config")
+        if ing_id is not None:
+            st.caption(f"Actual: {mod_ing.etiqueta_tipo(ing)}")
+            tipo, categoria = selector_tipo_categoria(
+                f"config_stock_{ing_id}", ing["tipo"], ing.get("categoria")
+            )
+            with st.form(f"form_config_stock_{ing_id}"):
+                minimo = st.number_input(
+                    f"Stock mínimo ({ing['unidad_base']}; 0 = sin aviso)",
+                    min_value=0.0, step=1.0, value=float(ing["stock_minimo"]),
+                )
+                enviado = st.form_submit_button("Guardar")
+            if enviado:
+                try:
+                    mod_stock.configurar_item(ing_id, tipo, minimo, categoria)
+                    st.success("Configuración guardada.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
+
+
 # --- Sección: Recetas -------------------------------------------------
 
 def seccion_recetas():
     st.header("🍞 Recetas")
-    tab_reporte, tab_crear, tab_ingredientes, tab_detalle = st.tabs(
-        ["Reporte de rentabilidad", "Crear receta", "Editar ingredientes", "Detalle de receta"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Reporte de rentabilidad", "Crear receta", "Editar ingredientes", "Detalle de receta"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_recetas",
     )
 
-    with tab_reporte:
+    if vista == "Reporte de rentabilidad":
         solo_activas = st.checkbox("Solo recetas activas", value=True)
         recetas = mod_rec.listar_recetas(solo_activas=solo_activas)
         if not recetas:
@@ -216,18 +535,25 @@ def seccion_recetas():
             ]
             df["margen_real"] = (df["margen_real"] * 100).round(1)
             df["margen_objetivo"] = (df["margen_objetivo"] * 100).round(1)
+            df["bajo_margen"] = df["bajo_margen"].map({True: "⚠ Bajo margen", False: "OK"})
 
             def resaltar_bajo_margen(fila):
-                color = "background-color: #ffe3e3" if fila["bajo_margen"] else ""
-                return [color] * len(fila)
+                # Rojo semitransparente (no un rosado claro fijo): se mezcla con
+                # el fondo del tema, así el texto (que sigue el color del tema)
+                # contrasta igual en modo claro y oscuro. El texto "⚠ Bajo margen"
+                # deja la alerta legible aunque no se distinga el color.
+                if fila["bajo_margen"] == "OK":
+                    return [""] * len(fila)
+                return ["background-color: rgba(255, 75, 75, 0.28)"] * len(fila)
 
             st.dataframe(
                 df.style.apply(resaltar_bajo_margen, axis=1),
                 width='stretch',
                 hide_index=True,
+                column_config={"bajo_margen": st.column_config.TextColumn("Estado")},
             )
 
-    with tab_crear:
+    elif vista == "Crear receta":
         with st.form("form_crear_receta", clear_on_submit=True):
             nombre = st.text_input("Nombre del pan (ej. Marraqueta)")
             precio_venta = st.number_input("Precio de venta", min_value=0.0, step=1.0)
@@ -251,7 +577,7 @@ def seccion_recetas():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ingredientes:
+    elif vista == "Editar ingredientes":
         receta_id = selector_receta("Receta", "sel_receta_ing")
         if receta_id is not None:
             try:
@@ -281,7 +607,7 @@ def seccion_recetas():
                 st.info("Esta receta todavía no tiene ingredientes.")
 
             st.subheader("Agregar o actualizar cantidad")
-            ing_id, ing = selector_ingrediente("Ingrediente", "sel_ing_para_receta")
+            ing_id, ing = selector_ingrediente("Ingrediente", "sel_ing_para_receta", solo_tipo="ingrediente")
             if ing_id is not None:
                 unidad = ing["unidad_base"]
                 with st.form("form_agregar_ing_receta"):
@@ -295,7 +621,7 @@ def seccion_recetas():
                     except Exception as e:
                         mostrar_error(e)
 
-    with tab_detalle:
+    elif vista == "Detalle de receta":
         receta_id = selector_receta("Receta", "sel_receta_detalle")
         if receta_id is not None:
             try:
@@ -367,6 +693,42 @@ def seccion_recetas():
             else:
                 st.info("Esta receta todavía no tiene ingredientes.")
 
+            st.subheader("Empaque de esta receta")
+            bolsas = [
+                i for i in mod_ing.listar_ingredientes()
+                if i["tipo"] == "insumo" and i.get("categoria") == "empaque"
+            ]
+            if d["empaque_ingrediente_id"] is not None:
+                st.caption(f"Actual: {d['empaque_nombre']} (${d['costo_empaque']:.2f} por unidad vendida)")
+            else:
+                st.caption(
+                    f"Sin bolsa asignada: se usa el empaque fijo de Costos indirectos "
+                    f"(${d['costo_empaque']:.2f} por unidad vendida)."
+                )
+            if not bolsas:
+                st.info(
+                    "Aún no hay empaques. Agrégalos en Ingredientes → Agregar "
+                    "(Tipo: Insumo, Categoría: Empaque) y vuelve aquí."
+                )
+            else:
+                sin_bolsa = "(sin bolsa: usar empaque fijo)"
+                opciones_bolsa = {sin_bolsa: None}
+                opciones_bolsa.update({f"{b['nombre']} · ${b['precio_actual']:.2f} c/u": b["id"] for b in bolsas})
+                etiquetas = list(opciones_bolsa)
+                actual = next(
+                    (k for k, v in opciones_bolsa.items() if v == d["empaque_ingrediente_id"]), sin_bolsa
+                )
+                with st.form(f"form_empaque_detalle_{receta_id}"):
+                    elegida = st.selectbox("Bolsa que usa", etiquetas, index=etiquetas.index(actual))
+                    enviado_emp = st.form_submit_button("Actualizar empaque")
+                if enviado_emp:
+                    try:
+                        mod_rec.actualizar_empaque(receta_id, opciones_bolsa[elegida])
+                        st.success("Empaque actualizado. Se descuenta 1 por pan vendido al pasar un pedido a producción.")
+                        st.rerun()
+                    except Exception as e:
+                        mostrar_error(e)
+
             st.subheader("Mano de obra de esta receta")
             st.caption(
                 f"Actual: {d['tiempo_preparacion_min']:.0f} min por lote de {d['unidades_por_lote']} unidades"
@@ -414,8 +776,15 @@ def seccion_recetas():
 
 def seccion_caja():
     st.header("💰 Flujo de caja")
-    tab_ingreso, tab_gasto, tab_movs, tab_reporte, tab_comisiones = st.tabs(
-        ["Registrar ingreso", "Registrar gasto", "Movimientos", "Reporte por período", "Comisiones"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Registrar ingreso", "Registrar gasto", "Movimientos", "Reporte por período", "Comisiones"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_caja",
     )
 
     def form_movimiento(tipo: str, key_prefix: str):
@@ -435,13 +804,13 @@ def seccion_caja():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ingreso:
+    if vista == "Registrar ingreso":
         form_movimiento("ingreso", "ingreso")
 
-    with tab_gasto:
+    elif vista == "Registrar gasto":
         form_movimiento("gasto", "gasto")
 
-    with tab_movs:
+    elif vista == "Movimientos":
         col1, col2 = st.columns(2)
         desde = col1.date_input("Desde", value=None, key="movs_desde")
         hasta = col2.date_input("Hasta", value=None, key="movs_hasta")
@@ -453,18 +822,58 @@ def seccion_caja():
             st.info("No hay movimientos en ese rango.")
         else:
             st.dataframe(pd.DataFrame(movimientos), width='stretch', hide_index=True)
-            ids = [m["id"] for m in movimientos]
-            col_a, col_b = st.columns([3, 1])
-            mov_a_eliminar = col_a.selectbox("Id a eliminar", ids, key="mov_eliminar")
-            if col_b.button("Eliminar", type="secondary"):
+
+            st.subheader("Corregir o eliminar un movimiento")
+            opciones_mov = {
+                f"#{m['id']} · {m['fecha']} · {m['tipo']} · ${m['monto']:,.0f} · {m['categoria'] or 'sin categoría'}": m
+                for m in movimientos
+            }
+            mov = opciones_mov[st.selectbox("Movimiento", list(opciones_mov.keys()), key="mov_editar")]
+
+            if mov["categoria"] in ("Pedido", "Comisión Mercado Pago"):
+                st.warning(
+                    "Este movimiento lo generó automáticamente el cobro de un pedido. Si lo "
+                    "corriges aquí, el total del pedido en Pedidos no cambia."
+                )
+
+            # La key incluye el id para que, al elegir otro movimiento, el
+            # formulario se vuelva a llenar con los datos de ese movimiento.
+            with st.form(f"form_editar_mov_{mov['id']}"):
+                col_t, col_m = st.columns(2)
+                tipo = col_t.selectbox(
+                    "Tipo", mod_caja.TIPOS_VALIDOS, index=mod_caja.TIPOS_VALIDOS.index(mov["tipo"])
+                )
+                monto = col_m.number_input("Monto", min_value=0.0, step=100.0, value=float(mov["monto"]))
+                col_p, col_f = st.columns(2)
+                medio = col_p.selectbox(
+                    "Medio de pago", mod_caja.MEDIOS_VALIDOS,
+                    index=mod_caja.MEDIOS_VALIDOS.index(mov["medio_pago"]),
+                )
+                fecha = col_f.date_input("Fecha", value=date.fromisoformat(mov["fecha"]))
+                categoria = st.text_input("Categoría (opcional)", value=mov["categoria"] or "")
+                descripcion = st.text_input("Descripción (opcional)", value=mov["descripcion"] or "")
+                guardar = st.form_submit_button("Guardar corrección")
+            if guardar:
                 try:
-                    mod_caja.eliminar_movimiento(mov_a_eliminar)
+                    mod_caja.actualizar_movimiento(
+                        mov["id"], tipo, monto, medio, categoria or None, descripcion or None,
+                        fecha.isoformat(),
+                    )
+                    st.success(f"Movimiento #{mov['id']} corregido.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
+
+            confirmar = st.checkbox(f"Confirmo que quiero eliminar el movimiento #{mov['id']}", key="mov_conf_eliminar")
+            if st.button("Eliminar movimiento", type="secondary", disabled=not confirmar):
+                try:
+                    mod_caja.eliminar_movimiento(mov["id"])
                     st.success("Movimiento eliminado.")
                     st.rerun()
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_reporte:
+    elif vista == "Reporte por período":
         col1, col2 = st.columns(2)
         desde = col1.date_input("Desde", value=None, key="rep_desde")
         hasta = col2.date_input("Hasta", value=None, key="rep_hasta")
@@ -493,10 +902,10 @@ def seccion_caja():
             else:
                 st.dataframe(df_cat, width='stretch')
 
-    with tab_comisiones:
+    elif vista == "Comisiones":
         st.caption(
             "Tasas que cobra el medio de pago electrónico (ej. Mercado Pago Point) al "
-            "cobrar con tarjeta. Al marcar un pedido como 'entregado y cobrado' con débito "
+            "cobrar con tarjeta. Al registrar el pago de un pedido con débito "
             "o crédito, se registra automáticamente un gasto aparte por esta comisión, "
             "junto al ingreso por el total del pedido. Actualiza estos valores el día que "
             "cambies de tramo de ventas con el proveedor. La transferencia y el efectivo "
@@ -560,7 +969,8 @@ def seccion_costos_indirectos():
             value=float(config["factor_descuento_luz"] * 100),
         )
         costo_empaque = st.number_input(
-            "Costo de empaque por unidad vendida (bolsa, caja, etc.) — igual para todas las recetas",
+            "Costo de empaque por unidad vendida — solo para recetas sin bolsa asignada "
+            "(las que tienen bolsa usan el precio de esa bolsa; se asigna en Recetas → Detalle)",
             min_value=0.0, step=1.0,
             value=float(config["costo_empaque_unidad"]),
         )
@@ -590,73 +1000,730 @@ def seccion_costos_indirectos():
 
 # --- Sección: Pedidos ------------------------------------------------------
 
-def seccion_pedidos():
-    st.header("📋 Pedidos")
-    tab_planificacion, tab_agenda, tab_crear, tab_items, tab_detalle, tab_capacidad = st.tabs(
-        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Detalle / Cobrar", "Capacidad de producción"]
+_ESTADOS_CALENDARIO = (
+    ("recibido", "Recibido", "#e0a100", "🟡"),
+    ("confirmado", "Confirmado", "#2f7fd8", "🔵"),
+    ("en_produccion", "En producción", "#e06a1f", "🟠"),
+    ("listo", "Listo", "#8a4fd0", "🟣"),
+    ("entregado", "Entregado", "#2e9e5b", "🟢"),
+)
+_DIAS_SEMANA = ["Lun", "Mar", "Mié", "Jue", "Vie", "Sáb", "Dom"]
+
+
+def _plural_estado(nombre: str, cantidad: int) -> str:
+    """'2 listos', '3 en producción' (lo que lleva 'en' no se pluraliza)."""
+    nombre = nombre.lower()
+    if cantidad > 1 and not nombre.startswith("en "):
+        nombre += "s"
+    return nombre
+
+
+def _calendario_html(anio: int, mes: int, pedidos_por_dia: dict, minutos_por_dia: dict,
+                     disponible_min: float, seleccionado: date | None) -> str:
+    """Grilla mensual en HTML: por día, un chip de color por estado con su
+    cantidad de pedidos. Borde rojo si el día está sobrevendido. Sin
+    indentación ni líneas en blanco para que markdown no lo trate como código."""
+    hoy = date.today()
+    partes = [
+        "<style>"
+        ".cal{display:grid;grid-template-columns:repeat(7,1fr);gap:4px;}"
+        ".cal-h{text-align:center;font-weight:600;font-size:.8rem;opacity:.7;padding:2px 0;}"
+        ".cal-d{min-height:78px;border:1px solid rgba(128,128,128,.3);border-radius:6px;padding:4px 6px;"
+        "font-size:.8rem;overflow:hidden;}"
+        ".cal-d.vacio{border:none;}"
+        ".cal-d.hoy{border:2px solid #2f7fd8;}"
+        ".cal-d.sel{background:rgba(47,127,216,.12);}"
+        ".cal-d.sobre{border:2px solid #d83a3a;}"
+        ".cal-n{font-weight:600;opacity:.85;}"
+        ".chip{display:block;color:#fff;border-radius:10px;padding:0 6px;margin-top:2px;font-size:.7rem;"
+        "white-space:nowrap;}"
+        "@media(max-width:640px){.cal-d{min-height:56px;padding:2px 3px}.chip{padding:0 3px;font-size:.62rem}}"
+        "</style>",
+        '<div class="cal">',
+    ]
+    partes += [f'<div class="cal-h">{d}</div>' for d in _DIAS_SEMANA]
+
+    for semana in calendar.Calendar(firstweekday=0).monthdatescalendar(anio, mes):
+        for d in semana:
+            if d.month != mes:
+                partes.append('<div class="cal-d vacio"></div>')
+                continue
+            iso = d.isoformat()
+            clases = "cal-d"
+            if d == hoy:
+                clases += " hoy"
+            if d == seleccionado:
+                clases += " sel"
+            if disponible_min > 0 and minutos_por_dia.get(iso, 0) > disponible_min:
+                clases += " sobre"
+            chips = "".join(
+                f'<span class="chip" style="background:{color}">{pedidos_por_dia[iso][clave]} {_plural_estado(nombre, pedidos_por_dia[iso][clave])}</span>'
+                for clave, nombre, color, _ in _ESTADOS_CALENDARIO
+                if pedidos_por_dia.get(iso, {}).get(clave)
+            )
+            partes.append(f'<div class="{clases}"><span class="cal-n">{d.day}</span>{chips}</div>')
+    partes.append("</div>")
+    return "".join(partes)
+
+
+def _vista_planificacion():
+    hoy = date.today()
+    if "plan_mes_ref" not in st.session_state:
+        st.session_state["plan_mes_ref"] = hoy.replace(day=1)
+    ref: date = st.session_state["plan_mes_ref"]
+
+    col_prev, col_titulo, col_hoy, col_next = st.columns([1, 4, 1.4, 1])
+    nuevo_mes = None
+    if col_prev.button("◀", key="plan_prev", help="Mes anterior", width="stretch"):
+        nuevo_mes = (ref - timedelta(days=1)).replace(day=1)
+    if col_next.button("▶", key="plan_next", help="Mes siguiente", width="stretch"):
+        nuevo_mes = (ref + timedelta(days=32)).replace(day=1)
+    if col_hoy.button("Hoy", key="plan_hoy", width="stretch"):
+        nuevo_mes = hoy.replace(day=1)
+    if nuevo_mes is not None:
+        st.session_state["plan_mes_ref"] = nuevo_mes
+        # Al cambiar de mes, el día seleccionado pasa a hoy (si cae en ese mes) o al día 1.
+        st.session_state["plan_dia_sel"] = hoy if nuevo_mes == hoy.replace(day=1) else nuevo_mes
+        st.rerun()
+    col_titulo.markdown(f"### {NOMBRES_MESES[ref.month - 1]} {ref.year}")
+
+    primer_dia = ref
+    ultimo_dia = ref.replace(day=calendar.monthrange(ref.year, ref.month)[1])
+
+    pedidos_mes = [
+        p for p in mod_pedidos.listar_pedidos(desde=primer_dia.isoformat(), hasta=ultimo_dia.isoformat())
+        if p["estado"] != "cancelado"
+    ]
+    pedidos_por_dia: dict[str, dict[str, int]] = {}
+    for p in pedidos_mes:
+        por_estado = pedidos_por_dia.setdefault(p["fecha_entrega"], {})
+        por_estado[p["estado"]] = por_estado.get(p["estado"], 0) + 1
+
+    minutos_por_dia = mod_prod.tiempo_comprometido_rango(primer_dia.isoformat(), ultimo_dia.isoformat())
+    disponible_dia_min = mod_prod.obtener_configuracion()["horas_disponibles_dia"] * 60
+
+    dia_sel = st.session_state.get("plan_dia_sel", hoy)
+    if not (primer_dia <= dia_sel <= ultimo_dia):
+        dia_sel = hoy if primer_dia <= hoy <= ultimo_dia else primer_dia
+    st.session_state["plan_dia_sel"] = dia_sel
+
+    st.markdown(
+        _calendario_html(ref.year, ref.month, pedidos_por_dia, minutos_por_dia, disponible_dia_min, dia_sel),
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        " · ".join(f"{emoji} {nombre}" for _, nombre, _, emoji in _ESTADOS_CALENDARIO)
+        + " — borde rojo: día sobrevendido (más trabajo que horas disponibles). "
+        "Los pedidos cancelados no se cuentan."
     )
 
-    with tab_planificacion:
-        st.subheader("Próximos días")
-        dias = st.slider("Ver los próximos... días", min_value=7, max_value=30, value=14, key="dias_planificacion")
-        resumen_dias = mod_pedidos.resumen_proximos_dias(dias)
-        df_dias = pd.DataFrame(resumen_dias).set_index("fecha")
-        st.bar_chart(df_dias["unidades_totales"])
-        st.caption("Unidades totales pedidas por día de entrega (no cuenta pedidos cancelados).")
-        st.dataframe(df_dias, width='stretch')
+    # --- Resumen del mes ---------------------------------------------------
+    st.divider()
+    st.subheader(f"Resumen de {NOMBRES_MESES[ref.month - 1].lower()}")
+    conteo = {clave: sum(1 for p in pedidos_mes if p["estado"] == clave) for clave, *_ in _ESTADOS_CALENDARIO}
+    por_cobrar = [p for p in pedidos_mes if _es_por_cobrar(p)]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pedidos del mes", len(pedidos_mes))
+    c2.metric("🟡 Recibidos", conteo["recibido"])
+    c3.metric("🔵 Confirmados", conteo["confirmado"])
+    c4, c5, c6 = st.columns(3)
+    c4.metric("🟠 En producción", conteo["en_produccion"])
+    c5.metric("🟣 Listos", conteo["listo"])
+    c6.metric("🟢 Entregados", conteo["entregado"])
+    if por_cobrar:
+        monto_por_cobrar = f"${sum(p['total'] for p in por_cobrar):,.0f}".replace(",", ".")
+        st.caption(f"💸 {len(por_cobrar)} pedido(s) entregado(s) sin pagar este mes, por {monto_por_cobrar}.")
 
+    # Tiempo: solo de hoy en adelante (lo ya pasado no se puede "usar").
+    desde_tiempo = max(primer_dia, hoy)
+    if desde_tiempo > ultimo_dia:
+        st.caption("Este mes ya terminó: no queda tiempo por planificar.")
+    else:
+        dias_restantes = (ultimo_dia - desde_tiempo).days + 1
+        requerido_min = sum(m for f, m in minutos_por_dia.items() if f >= desde_tiempo.isoformat())
+        disponible_min = disponible_dia_min * dias_restantes
+        restante_min = disponible_min - requerido_min
+        t1, t2, t3 = st.columns(3)
+        t1.metric("Tiempo requerido", f"{requerido_min / 60:.1f} h",
+                  help="Horas de preparación de los pedidos de hoy en adelante este mes.")
+        t2.metric("Tiempo disponible", f"{disponible_min / 60:.1f} h",
+                  help=f"{dias_restantes} día(s) × {disponible_dia_min / 60:.1f} h/día (configurable en Capacidad de producción).")
+        t3.metric("Tiempo restante", f"{restante_min / 60:.1f} h",
+                  delta="sobrevendido" if restante_min < 0 else None, delta_color="inverse")
+        if disponible_min > 0:
+            st.progress(min(max(requerido_min / disponible_min, 0.0), 1.0),
+                        text=f"{requerido_min / disponible_min * 100:.0f}% del tiempo del mes comprometido")
+        else:
+            st.info("Configura las horas disponibles por día en 'Capacidad de producción' para ver el tiempo restante.")
+
+    # --- Detalle del día ---------------------------------------------------
+    st.divider()
+    st.subheader("Detalle de un día")
+    dia_sel = st.date_input("Día", min_value=primer_dia, max_value=ultimo_dia, key="plan_dia_sel")
+    resumen = mod_pedidos.resumen_dia(dia_sel.isoformat())
+
+    col1, col2 = st.columns(2)
+    col1.metric("Pedidos ese día", resumen["cantidad_pedidos"])
+    col2.metric("Total a cobrar", f"${resumen['total_a_cobrar']:.2f}")
+
+    cap = mod_prod.capacidad_dia(dia_sel.isoformat())
+    texto_capacidad = f"Capacidad: {cap['comprometido_min']:.0f} / {cap['disponible_min']:.0f} min usados"
+    if cap["sobrevendido"]:
+        st.warning(f"⚠ {texto_capacidad} — este día está sobrevendido.")
+    else:
+        st.caption(texto_capacidad)
+
+    if resumen["items_agregados"]:
+        st.markdown("**Qué preparar ese día**")
+        df_items = pd.DataFrame(resumen["items_agregados"]).set_index("receta")
+        st.dataframe(df_items, width='stretch')
+
+        st.markdown("**Pedidos de ese día**")
+        for p in resumen["pedidos"]:
+            with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · "
+                             f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}"):
+                st.dataframe(pd.DataFrame(p["items"]), width='stretch', hide_index=True)
+                if p["notas"]:
+                    st.caption(f"Notas: {p['notas']}")
+    else:
+        st.info("No hay pedidos para este día.")
+
+
+_PASOS_FLUJO = ("recibido", "confirmado", "en_produccion", "listo", "entregado")
+
+# Botón y explicación para avanzar al estado siguiente (ver SIGUIENTE_ESTADO).
+_TEXTO_AVANZAR = {
+    "confirmado": ("✅ Confirmar pedido", "El cliente ya recibió el detalle del pedido y lo aceptó."),
+    "en_produccion": ("🔥 Pasar a producción", "Las cubetas ya están armadas y el pan horneando."),
+    "listo": ("🥖 Marcar listo", "El pan ya salió. Después avísale al cliente para coordinar la entrega."),
+}
+
+
+# --- Línea de tiempo del pedido (componente v2: HTML/CSS/JS propio) --------
+# Cada paso es un botón; al tocarlo, el JS manda la clave del estado elegido
+# a Python como "trigger" (dura un solo rerun) y Python cambia el estado.
+
+_CSS_LINEA_TIEMPO = """
+.lt { font-family: var(--st-font); color: var(--st-text-color); padding: 4px 0 2px; }
+.lt-pasos { display: grid; grid-template-columns: repeat(var(--n), 1fr); position: relative; }
+.lt-paso { display: flex; flex-direction: column; align-items: center; position: relative;
+  background: none; border: none; padding: 0 2px; font: inherit; color: inherit; cursor: default; }
+.lt-paso.clic { cursor: pointer; }
+.lt-paso::before { content: ""; position: absolute; top: 17px; right: 50%; width: 100%; height: 4px;
+  background: var(--st-border-color, rgba(128,128,128,.35)); z-index: 0; }
+.lt-paso:first-child::before { display: none; }
+.lt-paso.hecho::before, .lt-paso.actual::before { background: var(--c); }
+.lt-nodo { width: 32px; height: 32px; border-radius: 50%; display: flex; align-items: center;
+  justify-content: center; font-size: 15px; z-index: 1; position: relative;
+  border: 3px solid var(--st-border-color, rgba(128,128,128,.45));
+  background: var(--st-background-color); color: var(--st-gray-text-color, #888);
+  transition: transform .12s ease, box-shadow .12s ease; }
+.lt-paso.hecho .lt-nodo { background: var(--c); border-color: var(--c); color: #fff; }
+.lt-paso.actual .lt-nodo { background: var(--c); border-color: var(--c); color: #fff;
+  box-shadow: 0 0 0 5px color-mix(in srgb, var(--c) 28%, transparent); transform: scale(1.12); }
+.lt-paso.clic:hover .lt-nodo, .lt-paso.clic:focus-visible .lt-nodo { transform: scale(1.15);
+  border-color: var(--c); }
+.lt-paso:focus-visible { outline: none; }
+.lt-paso:focus-visible .lt-etq { text-decoration: underline; }
+.lt-etq { margin-top: 8px; font-size: .78rem; line-height: 1.15; text-align: center; opacity: .75; }
+.lt-paso.actual .lt-etq { font-weight: 700; opacity: 1; }
+.lt-paso.hecho .lt-etq { opacity: .95; }
+.lt-aviso { margin-top: 10px; font-size: .8rem; color: var(--st-red-text-color, #d83a3a); text-align: center; }
+.lt.cancelado .lt-pasos { opacity: .45; filter: grayscale(1); }
+@media (max-width: 480px) { .lt-nodo { width: 26px; height: 26px; font-size: 12px; }
+  .lt-paso::before { top: 14px; } .lt-etq { font-size: .66rem; } }
+"""
+
+_JS_LINEA_TIEMPO = """
+export default function (component) {
+  const { data, parentElement, setTriggerValue } = component
+  const root = parentElement.querySelector("#lt")
+  if (!root || !data) return
+  const pasos = data.pasos || []
+  const iActual = pasos.findIndex((p) => p.clave === data.actual)
+  root.className = "lt" + (data.cancelado ? " cancelado" : "")
+  root.innerHTML = ""
+  const fila = document.createElement("div")
+  fila.className = "lt-pasos"
+  fila.style.setProperty("--n", String(pasos.length))
+  pasos.forEach((p, i) => {
+    const b = document.createElement("button")
+    b.type = "button"
+    let clase = "lt-paso"
+    if (!data.cancelado && iActual >= 0) {
+      if (i < iActual) clase += " hecho"
+      else if (i === iActual) clase += " actual"
+    }
+    const clickeable = data.editable && i !== iActual
+    if (clickeable) clase += " clic"
+    b.className = clase
+    b.style.setProperty("--c", p.color)
+    b.disabled = !clickeable
+    b.title = clickeable ? "Mover el pedido a: " + p.etiqueta : p.etiqueta
+    const nodo = document.createElement("span")
+    nodo.className = "lt-nodo"
+    nodo.textContent = (!data.cancelado && i < iActual) ? "✓" : p.emoji
+    const etq = document.createElement("span")
+    etq.className = "lt-etq"
+    etq.textContent = p.etiqueta
+    b.append(nodo, etq)
+    if (clickeable) b.onclick = () => setTriggerValue("elegido", p.clave)
+    fila.appendChild(b)
+  })
+  root.appendChild(fila)
+  if (data.cancelado) {
+    const aviso = document.createElement("div")
+    aviso.className = "lt-aviso"
+    aviso.textContent = "✖ Pedido cancelado"
+    root.appendChild(aviso)
+  }
+}
+"""
+
+_LINEA_TIEMPO = st.components.v2.component(
+    "linea_tiempo_pedido",
+    html='<div id="lt" class="lt"></div>',
+    css=_CSS_LINEA_TIEMPO,
+    js=_JS_LINEA_TIEMPO,
+)
+
+_ICONOS_PASO = {"recibido": "📥", "confirmado": "✅", "en_produccion": "🔥", "listo": "🥖", "entregado": "📦"}
+
+
+def linea_tiempo_pedido(pedido: dict, editable: bool, key: str) -> str | None:
+    """Dibuja la línea de tiempo del pedido. Retorna la clave del estado
+    que se tocó en este rerun (o None)."""
+    colores = {clave: color for clave, _, color, _ in _ESTADOS_CALENDARIO}
+    resultado = _LINEA_TIEMPO(
+        data={
+            "pasos": [
+                {"clave": e, "etiqueta": mod_pedidos.etiqueta_estado(e),
+                 "color": colores[e], "emoji": _ICONOS_PASO[e]}
+                for e in _PASOS_FLUJO
+            ],
+            "actual": pedido["estado"],
+            "cancelado": pedido["estado"] == "cancelado",
+            "editable": editable,
+        },
+        key=key,
+        on_elegido_change=lambda: None,
+    )
+    return resultado.elegido
+
+
+
+def _linea_estado_pago(pedido: dict) -> str:
+    partes = [f"Estado: {mod_pedidos.etiqueta_estado(pedido['estado'])}"]
+    if pedido["pagado"]:
+        detalle_pago = f"Pagado ({pedido['medio_pago']}"
+        if pedido.get("fecha_pago"):
+            detalle_pago += f", {pedido['fecha_pago']}"
+        partes.append(detalle_pago + ")")
+    else:
+        partes.append("Sin pagar" if pedido["estado"] != "entregado" else "💸 Por cobrar")
+    if pedido.get("fecha_entregado"):
+        partes.append(f"Entregado el {pedido['fecha_entregado']}")
+    if pedido.get("canal_origen"):
+        partes.append(f"Llegó por {mod_pedidos.ETIQUETAS_CANAL[pedido['canal_origen']]}")
+    return " · ".join(partes)
+
+
+def _avisar_pago(pedido_id: int, medio: str, resultado: dict):
+    """Mensaje de éxito tras registrar un pago (con la comisión, si hubo)."""
+    mensaje = f"Pago registrado. Ingreso #{resultado['movimiento_ingreso_id']} en Caja."
+    if resultado["comision"] > 0:
+        mensaje += (
+            f" Además, gasto de ${resultado['comision']:.2f} por comisión de {medio} "
+            f"(#{resultado['movimiento_gasto_comision_id']})."
+        )
+    st.toast(mensaje)
+
+
+def _texto_faltantes(faltantes: list[dict]) -> str:
+    return ", ".join(
+        f"{f['nombre']} (falta {_fmt_cantidad(f['falta'], f['unidad_base'])})" for f in faltantes
+    )
+
+
+def _bloque_faltantes_pedido(pedido_id: int, pedido: dict):
+    """Aviso de ingredientes que no alcanzan, mientras el pedido todavía no
+    descuenta stock (recibido o confirmado)."""
+    if pedido["estado"] not in ("recibido", "confirmado") or not pedido["items"]:
+        return
+    faltantes = mod_stock.faltantes_pedido(pedido_id)
+    if faltantes:
+        st.warning(
+            "📦 Con el stock actual **no alcanzan** los ingredientes: "
+            + _texto_faltantes(faltantes)
+            + ". Se pueden registrar compras en Stock; igual se puede seguir con el pedido."
+        )
+
+
+def _bloque_estado_pedido(pedido_id: int, pedido: dict):
+    """Línea de tiempo del pedido. Si está abierto, tocar un paso lo mueve
+    a ese estado (también hacia atrás, para corregir); tocar "Entregado"
+    abre el formulario de entrega, que pide si pagó o no."""
+    estado = pedido["estado"]
+    abierto = estado in mod_pedidos.ESTADOS_ABIERTOS
+    clave_entrega = "entregar_pedido_id"  # ids con el formulario de entrega abierto
+
+    st.subheader("Avance del pedido")
+    elegido = linea_tiempo_pedido(pedido, editable=abierto, key=f"linea_tiempo_{pedido_id}")
+
+    if not isinstance(st.session_state.get(clave_entrega), set):  # sesiones de la versión anterior
+        st.session_state[clave_entrega] = set()
+    entregas_abiertas = st.session_state[clave_entrega]
+    if elegido == "entregado":
+        entregas_abiertas.add(pedido_id)
+    elif elegido:
+        try:
+            faltantes = mod_pedidos.actualizar_estado(pedido_id, elegido)
+            entregas_abiertas.discard(pedido_id)
+            st.toast(f"Pedido #{pedido_id}: {mod_pedidos.etiqueta_estado(elegido)}.")
+            if elegido == "en_produccion":
+                st.toast("Stock descontado según la receta.", icon="📦")
+            if faltantes:
+                # El toast sobrevive al st.rerun() de abajo; un st.warning no.
+                st.toast("⚠ Faltan ingredientes: " + _texto_faltantes(faltantes), icon="⚠️")
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            st.rerun()
+
+    if not abierto:
+        return
+
+    if pedido_id in entregas_abiertas:
+        with st.container(border=True):
+            _bloque_entregar_pedido(pedido_id, pedido)
+            if st.button("Cerrar", key=f"btn_cerrar_entrega_{pedido_id}"):
+                entregas_abiertas.discard(pedido_id)
+                st.rerun()
+        return
+
+    siguiente = mod_pedidos.SIGUIENTE_ESTADO[estado]
+    if siguiente in _TEXTO_AVANZAR:
+        boton, ayuda = _TEXTO_AVANZAR[siguiente]
+        st.caption(f"Toca un paso para mover el pedido. Siguiente: **{boton}** — {ayuda}")
+    else:
+        st.caption("Ya está listo: avísale al cliente y toca **Entregado** cuando lo entregues.")
+
+
+def _bloque_entregar_pedido(pedido_id: int, pedido: dict):
+    """Marcar entregado, con o sin pago en el momento."""
+    st.subheader("Entregar")
+    if pedido["pagado"]:
+        st.caption("Este pedido ya está pagado: solo queda marcarlo como entregado.")
+    else:
+        st.caption(
+            "Si el cliente paga al recibir, márcalo aquí mismo y se registra el ingreso en Caja. "
+            "Si no, queda como **por cobrar** y el pago se registra después."
+        )
+
+    with st.form(f"form_entregar_pedido_{pedido_id}"):
+        pago_al_recibir = False
+        medio = None
+        if not pedido["pagado"]:
+            pago_al_recibir = st.radio(
+                "¿Pagó al recibir?", [False, True],
+                format_func=lambda v: "Sí, pagó al recibir" if v else "No, queda por cobrar",
+                horizontal=True, key=f"pago_al_recibir_{pedido_id}",
+            )
+            medio = st.selectbox("Medio de pago (si pagó)", mod_caja.MEDIOS_VALIDOS,
+                                 key=f"medio_entrega_{pedido_id}")
+        fecha = st.date_input("Fecha de entrega", value=date.today(), max_value=date.today(),
+                              key=f"fecha_entrega_real_{pedido_id}")
+        enviado = st.form_submit_button("Marcar entregado")
+    if enviado:
+        try:
+            if pago_al_recibir:
+                resultado = mod_pedidos.entregar_y_cobrar(pedido_id, medio, fecha.isoformat())
+            else:
+                mod_pedidos.marcar_entregado(pedido_id, fecha.isoformat())
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            if pago_al_recibir:
+                _avisar_pago(pedido_id, medio, resultado)
+            else:
+                st.toast(f"Pedido #{pedido_id} entregado.")
+            entregas = st.session_state.get("entregar_pedido_id")
+            if isinstance(entregas, set):
+                entregas.discard(pedido_id)
+            st.rerun()
+
+
+def _bloque_registrar_pago(pedido_id: int, pedido: dict):
+    """Registrar el pago por separado: de un pedido ya entregado (por
+    cobrar) o por adelantado, antes de entregarlo."""
+    if pedido["estado"] == "entregado":
+        st.subheader("💸 Registrar pago")
+        dias = None
+        if pedido.get("fecha_entregado"):
+            dias = (date.today() - date.fromisoformat(pedido["fecha_entregado"])).days
+        st.caption(
+            "Entregado sin pago"
+            + (f" hace {dias} día(s)" if dias is not None else "")
+            + "."
+        )
+        contenedor = st.container()
+    else:
+        contenedor = st.expander("💸 Registrar pago por adelantado (antes de entregar)")
+
+    with contenedor:
+        _form_registrar_pago(pedido_id, "detalle")
+
+
+def _form_registrar_pago(pedido_id: int, sufijo: str):
+    """Formulario medio + fecha → registrar_pago. `sufijo` distingue las
+    claves cuando hay varios en la misma pantalla (lista Por cobrar)."""
+    with st.form(f"form_registrar_pago_{sufijo}_{pedido_id}"):
+        col_medio, col_fecha = st.columns(2)
+        medio = col_medio.selectbox("Medio de pago", mod_caja.MEDIOS_VALIDOS,
+                                    key=f"medio_pago_{sufijo}_{pedido_id}")
+        fecha = col_fecha.date_input("Fecha del pago", value=date.today(), max_value=date.today(),
+                                     key=f"fecha_pago_{sufijo}_{pedido_id}")
+        enviado = st.form_submit_button("Registrar pago")
+    if enviado:
+        try:
+            resultado = mod_pedidos.registrar_pago(pedido_id, medio, fecha.isoformat())
+        except Exception as e:
+            mostrar_error(e)
+        else:
+            _avisar_pago(pedido_id, medio, resultado)
+            st.rerun()
+
+
+def _vista_por_cobrar():
+    """Pedidos entregados sin pagar: cuánto se debe, hace cuántos días se
+    entregó y a cuáles ya toca recordarles el pago."""
+    config = mod_pedidos.obtener_configuracion_cobranza()
+    pedidos = mod_pedidos.listar_por_cobrar()
+
+    total = sum(p["total"] for p in pedidos)
+    a_recordar = [p for p in pedidos if p["toca_recordar"]]
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Pedidos por cobrar", len(pedidos))
+    c2.metric("Monto adeudado", f"${total:,.0f}".replace(",", "."))
+    c3.metric("🔔 Toca recordar", len(a_recordar),
+              help=f"Entregados hace {config['dias_recordatorio']} día(s) o más.")
+
+    with st.expander(f"⚙️ Avisar a los {config['dias_recordatorio']} día(s) de la entrega"):
+        with st.form("form_config_cobranza"):
+            dias = st.number_input(
+                "Días desde la entrega para recordar el pago", min_value=0, step=1,
+                value=int(config["dias_recordatorio"]),
+                help="No es un plazo de pago: solo cuándo el sistema marca el pedido como 'toca recordar'.",
+            )
+            if st.form_submit_button("Guardar"):
+                try:
+                    mod_pedidos.actualizar_dias_recordatorio(int(dias))
+                    st.toast("Configuración de cobranza guardada.")
+                    st.rerun()
+                except Exception as e:
+                    mostrar_error(e)
+
+    if not pedidos:
+        st.success("No hay pedidos por cobrar. 🎉")
+        return
+
+    st.caption("Del más antiguo al más reciente. Abre uno para registrar el pago.")
+    for p in pedidos:
+        marca = "🔔 " if p["toca_recordar"] else ""
+        dias_txt = "hoy" if p["dias_desde_entrega"] == 0 else f"hace {p['dias_desde_entrega']} día(s)"
+        monto = f"${p['total']:,.0f}".replace(",", ".")
+        with st.expander(f"{marca}#{p['id']} · {p['cliente_nombre']} · {monto} · entregado {dias_txt}"):
+            if p["cliente_telefono"]:
+                st.caption(f"Teléfono: {p['cliente_telefono']}")
+            _form_registrar_pago(p["id"], "por_cobrar")
+
+
+@st.dialog("¿Quitar este ítem?")
+def _confirmar_quitar_item(pedido: dict, receta_id: int, nombre: str):
+    item = next(i for i in pedido["items"] if i["receta_id"] == receta_id)
+    st.write(
+        f"Vas a quitar **{item['cantidad']} x {nombre}** del pedido "
+        f"**#{pedido['id']}** de **{pedido['cliente_nombre']}**."
+    )
+    col_si, col_no = st.columns(2)
+    if col_si.button("Sí, quitar", type="primary", width="stretch"):
+        try:
+            mod_pedidos.quitar_item_pedido(pedido["id"], receta_id)
+            st.toast(f"'{nombre}' quitado del pedido #{pedido['id']}.")
+            st.rerun()
+        except Exception as e:
+            mostrar_error(e)
+    if col_no.button("Cancelar", width="stretch"):
+        st.rerun()
+
+
+def _detalle_pedido_completo(pedido_id: int):
+    """Toda la información de un pedido y sus acciones (avanzar en la
+    línea de tiempo, reagendar, entregar, pagar, cancelar, eliminar).
+    Todas las claves llevan el id para poder abrir varios pedidos a la vez."""
+    pedido = mod_pedidos.detalle_pedido(pedido_id)
+
+    col1, col2, col3 = st.columns(3)
+    col1.metric("Cliente", pedido["cliente_nombre"])
+    col2.metric("Fecha de entrega", pedido["fecha_entrega"])
+    col3.metric("Total", f"${pedido['total']:.2f}")
+    st.caption(_linea_estado_pago(pedido))
+    if pedido["notas"]:
+        st.caption(f"Notas: {pedido['notas']}")
+
+    if pedido["items"]:
+        st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
+    else:
+        st.info("Este pedido todavía no tiene ítems.")
+
+    abierto = pedido["estado"] in mod_pedidos.ESTADOS_ABIERTOS
+
+    _bloque_faltantes_pedido(pedido_id, pedido)
+
+    st.divider()
+    _bloque_estado_pedido(pedido_id, pedido)
+
+    if abierto:
         st.divider()
-        st.subheader("Detalle de un día")
-        fecha_sel = st.date_input("Fecha de entrega", value=date.today(), key="fecha_planificacion_detalle")
-        resumen = mod_pedidos.resumen_dia(fecha_sel.isoformat())
+        st.markdown("**Reagendar**")
+        st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
+        with st.form(f"form_reagendar_pedido_{pedido_id}"):
+            nueva_fecha = st.date_input(
+                "Nueva fecha de entrega",
+                value=date.fromisoformat(pedido["fecha_entrega"]), key=f"nueva_fecha_{pedido_id}",
+            )
+            enviado = st.form_submit_button("Reagendar pedido")
+        if enviado:
+            try:
+                mod_pedidos.reagendar_pedido(pedido_id, nueva_fecha.isoformat())
+                st.toast(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
 
-        col1, col2 = st.columns(2)
-        col1.metric("Pedidos ese día", resumen["cantidad_pedidos"])
-        col2.metric("Total a cobrar", f"${resumen['total_a_cobrar']:.2f}")
+    if not pedido["pagado"] and pedido["estado"] != "cancelado" and pedido["items"]:
+        st.divider()
+        _bloque_registrar_pago(pedido_id, pedido)
 
-        cap = mod_prod.capacidad_dia(fecha_sel.isoformat())
-        texto_capacidad = f"Capacidad: {cap['comprometido_min']:.0f} / {cap['disponible_min']:.0f} min usados"
-        if cap["sobrevendido"]:
-            st.warning(f"⚠ {texto_capacidad} — este día está sobrevendido.")
-        else:
-            st.caption(texto_capacidad)
+    if abierto:
+        st.divider()
+        if pedido["pagado"]:
+            st.caption(
+                "⚠ Este pedido ya está pagado: si lo cancelas, el ingreso sigue en Caja "
+                "(registra ahí la devolución si corresponde)."
+            )
+        if st.button("Cancelar pedido", type="secondary", key=f"btn_cancelar_{pedido_id}"):
+            try:
+                mod_pedidos.cancelar_pedido(pedido_id)
+                st.toast("Pedido cancelado.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
 
-        if resumen["items_agregados"]:
-            st.subheader("Qué preparar ese día")
-            df_items = pd.DataFrame(resumen["items_agregados"]).set_index("receta")
-            st.bar_chart(df_items["cantidad_total"])
-            st.dataframe(df_items, width='stretch')
+    st.divider()
+    st.markdown("**Eliminar pedido**")
+    st.caption(
+        "Para pedidos mal tomados o de prueba: borra el pedido y sus ítems por completo "
+        "(a diferencia de Cancelar, no queda registro). No se puede si ya fue cobrado."
+    )
+    if pedido["pagado"]:
+        st.warning(
+            "Este pedido ya fue cobrado y generó un ingreso en Flujo de caja. "
+            "Anula ese movimiento en Caja primero si de verdad quieres eliminarlo, "
+            "o usa 'Cancelar pedido' en su lugar."
+        )
+    else:
+        confirmar_eliminar = st.checkbox(
+            f"Confirmo que quiero eliminar el pedido #{pedido_id} definitivamente", key=f"chk_eliminar_{pedido_id}"
+        )
+        if st.button("Eliminar pedido", type="secondary", disabled=not confirmar_eliminar, key=f"btn_eliminar_{pedido_id}"):
+            try:
+                mod_pedidos.eliminar_pedido(pedido_id)
+                st.toast(f"Pedido #{pedido_id} eliminado.")
+                st.rerun()
+            except Exception as e:
+                mostrar_error(e)
 
-            st.subheader("Pedidos de ese día")
-            for p in resumen["pedidos"]:
-                with st.expander(f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"):
-                    st.dataframe(pd.DataFrame(p["items"]), width='stretch', hide_index=True)
-                    if p["notas"]:
-                        st.caption(f"Notas: {p['notas']}")
-        else:
-            st.info("No hay pedidos para este día.")
 
-    with tab_agenda:
+_DIAS_ENTREGADOS_LINEA = 14
+
+
+def _vista_linea_produccion():
+    """Todos los pedidos, agrupados por etapa (Recibido → Entregado). Al
+    tocar uno se despliega su detalle completo para irlo avanzando."""
+    desde_entregados = (date.today() - timedelta(days=_DIAS_ENTREGADOS_LINEA)).isoformat()
+    pedidos = [
+        p for p in mod_pedidos.listar_pedidos()
+        if p["estado"] in _ESTADOS_FILTRO
+        and (p["estado"] != "entregado"
+             or (p.get("fecha_entregado") or p["fecha_entrega"]) >= desde_entregados)
+    ]
+    st.caption(
+        "Toca un pedido para ver todo su detalle y avanzarlo. Entregados: solo los de los "
+        f"últimos {_DIAS_ENTREGADOS_LINEA} días (el resto, en Agenda)."
+    )
+    iconos = {clave: emoji for clave, _, _, emoji in _ESTADOS_CALENDARIO}
+    for estado in _ESTADOS_FILTRO:
+        grupo = [p for p in pedidos if p["estado"] == estado]
+        st.markdown(f"#### {iconos[estado]} {mod_pedidos.etiqueta_estado(estado)} ({len(grupo)})")
+        if not grupo:
+            st.caption("Sin pedidos en esta etapa.")
+            continue
+        for p in grupo:
+            fecha = date.fromisoformat(p["fecha_entrega"]).strftime("%d-%m")
+            monto = f"${p['total']:,.0f}".replace(",", ".")
+            exp = st.expander(
+                f"#{p['id']} · {p['cliente_nombre']} · entrega {fecha} · {monto}{_marca_pago(p)}",
+                key=f"exp_pedido_{p['id']}", on_change="rerun",
+            )
+            # El detalle solo se arma para los pedidos abiertos (con 50+
+            # pedidos, dibujarlos todos haría lenta cada interacción).
+            if exp.open:
+                with exp:
+                    _detalle_pedido_completo(p["id"])
+
+
+def seccion_pedidos():
+    st.header("📋 Pedidos")
+    a_recordar = [p for p in mod_pedidos.listar_por_cobrar() if p["toca_recordar"]]
+    if a_recordar:
+        st.warning(
+            f"🔔 {len(a_recordar)} pedido(s) entregado(s) sin pagar ya pasaron el plazo de aviso. "
+            "Revísalos en **Por cobrar**."
+        )
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son decenas de
+    # consultas por click. Con este selector solo corre la sección activa.
+    if st.session_state.get("vista_pedidos") == "Detalle / Cobrar":  # nombre anterior
+        st.session_state["vista_pedidos"] = "Línea de producción"
+    vista = st.radio(
+        "Sección",
+        ["Planificación", "Agenda", "Crear pedido", "Agregar ítems", "Línea de producción", "Por cobrar",
+         "Capacidad de producción"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_pedidos",
+    )
+
+    if vista == "Planificación":
+        _vista_planificacion()
+
+    elif vista == "Por cobrar":
+        _vista_por_cobrar()
+
+    elif vista == "Agenda":
         col1, col2, col3 = st.columns(3)
         desde = col1.date_input("Desde", value=None, key="ped_desde")
         hasta = col2.date_input("Hasta", value=None, key="ped_hasta")
-        opciones_estado = ["Pendientes y confirmados", "(todos)"] + list(mod_pedidos.ESTADOS_VALIDOS)
-        estado = col3.selectbox("Estado", opciones_estado, key="ped_filtro_estado")
-
-        if estado == "Pendientes y confirmados":
-            pedidos = [
-                p for p in mod_pedidos.listar_pedidos(
-                    desde=desde.isoformat() if desde else None,
-                    hasta=hasta.isoformat() if hasta else None,
-                )
-                if p["estado"] not in ("entregado", "cancelado")
-            ]
-        else:
-            pedidos = mod_pedidos.listar_pedidos(
-                desde=desde.isoformat() if desde else None,
-                hasta=hasta.isoformat() if hasta else None,
-                estado=None if estado == "(todos)" else estado,
-            )
+        opcion_filtro = col3.selectbox("Estado", _opciones_filtro_pedidos(), key="ped_filtro_estado")
+        estado, filtro = _aplicar_filtro_pedidos(opcion_filtro)
+        pedidos = mod_pedidos.listar_pedidos(
+            desde=desde.isoformat() if desde else None,
+            hasta=hasta.isoformat() if hasta else None,
+            estado=estado,
+        )
+        if filtro is not None:
+            pedidos = [p for p in pedidos if filtro(p)]
 
         if not pedidos:
             st.info("No hay pedidos en ese rango.")
@@ -668,9 +1735,8 @@ def seccion_pedidos():
                     fecha_agrupada = p["fecha_entrega"]
                     st.markdown(f"**📅 {fecha_agrupada}**")
 
-                titulo = f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · {p['estado']}"
-                if p["pagado"]:
-                    titulo += " · pagado"
+                titulo = (f"#{p['id']} · {p['cliente_nombre']} · ${p['total']:.2f} · "
+                          f"{mod_pedidos.etiqueta_estado(p['estado'])}{_marca_pago(p)}")
                 with st.expander(titulo):
                     if p["items"]:
                         st.dataframe(
@@ -683,19 +1749,22 @@ def seccion_pedidos():
                         st.caption(f"Notas: {p['notas']}")
                     if p["cliente_telefono"]:
                         st.caption(f"Teléfono: {p['cliente_telefono']}")
+                    if p.get("canal_origen"):
+                        st.caption(f"Llegó por: {mod_pedidos.ETIQUETAS_CANAL[p['canal_origen']]}")
 
             with st.expander("Ver como tabla resumen"):
                 df = pd.DataFrame(pedidos)[
                     ["id", "fecha_entrega", "cliente_nombre", "cliente_telefono",
                      "estado", "pagado", "total"]
                 ]
+                df["estado"] = df["estado"].map(mod_pedidos.etiqueta_estado)
                 st.dataframe(df, width='stretch', hide_index=True)
 
         st.divider()
         st.subheader("Reagendar varios pedidos de un mismo día")
         st.caption(
             "Por ejemplo, si un día se cae la producción por fuerza mayor: mueve de una "
-            "sola vez todos los pedidos de ese día (pendientes/confirmados) a otra fecha."
+            "sola vez todos los pedidos de ese día (los que no estén entregados ni cancelados) a otra fecha."
         )
         col1, col2 = st.columns(2)
         fecha_origen = col1.date_input("Fecha actual de esos pedidos", value=date.today(), key="ped_reag_origen")
@@ -706,7 +1775,7 @@ def seccion_pedidos():
             if p["estado"] not in ("entregado", "cancelado")
         ]
         if not pedidos_a_mover:
-            st.info(f"No hay pedidos pendientes/confirmados el {fecha_origen.isoformat()} para reagendar.")
+            st.info(f"No hay pedidos sin entregar el {fecha_origen.isoformat()} para reagendar.")
         else:
             st.write(f"Se reagendarán **{len(pedidos_a_mover)}** pedido(s):")
             df_mover = pd.DataFrame(pedidos_a_mover)[
@@ -724,7 +1793,7 @@ def seccion_pedidos():
                 except Exception as e:
                     mostrar_error(e)
 
-    with tab_crear:
+    elif vista == "Crear pedido":
         clientes_existentes = mod_clientes.listar_clientes()
         modo_cliente = st.radio(
             "Cliente",
@@ -746,6 +1815,10 @@ def seccion_pedidos():
                 nuevo_telefono = st.text_input("Teléfono (opcional)", key="nuevo_cliente_telefono_pedido")
                 nuevo_direccion = st.text_input("Dirección (opcional)", key="nuevo_cliente_direccion_pedido")
             fecha_entrega = st.date_input("Fecha de entrega", value=date.today())
+            canal = st.selectbox(
+                "¿Por dónde llegó el pedido?", mod_pedidos.CANALES_VALIDOS,
+                format_func=lambda c: mod_pedidos.ETIQUETAS_CANAL[c], key="canal_pedido",
+            )
             notas = st.text_area("Notas (opcional)")
             enviado = st.form_submit_button("Crear pedido")
 
@@ -758,7 +1831,9 @@ def seccion_pedidos():
                 elif cliente_id is None:
                     raise ValueError("Selecciona un cliente")
 
-                pedido_id = mod_pedidos.crear_pedido(cliente_id, fecha_entrega.isoformat(), notas or None)
+                pedido_id = mod_pedidos.crear_pedido(
+                    cliente_id, fecha_entrega.isoformat(), notas or None, canal_origen=canal
+                )
                 mensaje = f"Pedido #{pedido_id} creado. Agrégale ítems aquí mismo abajo."
                 if modo_cliente == "Crear nuevo":
                     mensaje = f"Cliente '{nuevo_nombre}' creado. " + mensaje
@@ -772,7 +1847,7 @@ def seccion_pedidos():
             try:
                 pedido_nuevo = mod_pedidos.detalle_pedido(pedido_nuevo_id)
             except ValueError:
-                # El pedido ya no existe (por ejemplo, se eliminó desde Detalle / Cobrar).
+                # El pedido ya no existe (por ejemplo, se eliminó desde Línea de producción).
                 del st.session_state["pedido_en_construccion"]
                 pedido_nuevo = None
 
@@ -812,191 +1887,62 @@ def seccion_pedidos():
                     del st.session_state["pedido_en_construccion"]
                     st.rerun()
 
-    with tab_items:
-        pedido_id = selector_pedido("Pedido", "sel_pedido_items")
+    elif vista == "Agregar ítems":
+        # Solo se agregan ítems antes de empezar a hornear.
+        pedido_id = selector_pedido(
+            "Pedido", "sel_pedido_items",
+            filtro=lambda p: p["estado"] in ("recibido", "confirmado"),
+        )
         if pedido_id is not None:
             pedido = mod_pedidos.detalle_pedido(pedido_id)
-            if pedido["estado"] in ("entregado", "cancelado"):
-                st.warning(f"Este pedido ya está '{pedido['estado']}', no se puede seguir editando.")
-            else:
-                receta_id = selector_receta("Receta", "sel_receta_para_pedido")
-                if receta_id is not None:
-                    cantidad = st.number_input("Cantidad", min_value=1, step=1, key="cant_item_pedido")
 
-                    disponibilidad = mod_prod.verificar_disponibilidad(
-                        pedido["fecha_entrega"], receta_id, cantidad, excluir_pedido_id=pedido_id
-                    )
-                    if not disponibilidad["cabe"]:
-                        st.warning(
-                            f"⚠ Esto sobrepasa tu capacidad para el {pedido['fecha_entrega']}: "
-                            f"necesita {disponibilidad['tiempo_necesario_min']:.0f} min y solo "
-                            f"quedan {disponibilidad['libre_min']:.0f} min libres ese día. "
-                            "Puedes agregarlo igual si decides sobrevender a propósito."
-                        )
-
-                    if st.button("Agregar/actualizar ítem"):
-                        try:
-                            mod_pedidos.agregar_item_pedido(pedido_id, receta_id, cantidad)
-                            st.success("Ítem agregado/actualizado en el pedido.")
-                            st.rerun()
-                        except Exception as e:
-                            mostrar_error(e)
-
+            # 1. Ítems actuales y su tabla
+            st.subheader("Ítems actuales del pedido")
             if pedido["items"]:
-                st.subheader("Ítems actuales del pedido")
                 st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
                 st.metric("Total del pedido", f"${pedido['total']:.2f}")
+            else:
+                st.caption("Este pedido todavía no tiene ítems.")
 
-                if pedido["estado"] not in ("entregado", "cancelado"):
-                    col_sel, col_btn = st.columns([3, 1])
-                    opciones_quitar = {i["nombre"]: i["receta_id"] for i in pedido["items"]}
-                    nombre_a_quitar = col_sel.selectbox(
-                        "Ítem a quitar", list(opciones_quitar.keys()), key="sel_quitar_item_pedido"
+            # 2. Ítem para agregar y su cantidad
+            receta_id = selector_receta("Ítem para agregar", "sel_receta_para_pedido")
+            if receta_id is not None:
+                cantidad = st.number_input("Cantidad", min_value=1, step=1, key="cant_item_pedido")
+
+                disponibilidad = mod_prod.verificar_disponibilidad(
+                    pedido["fecha_entrega"], receta_id, cantidad, excluir_pedido_id=pedido_id
+                )
+                if not disponibilidad["cabe"]:
+                    st.warning(
+                        f"⚠ Esto sobrepasa tu capacidad para el {pedido['fecha_entrega']}: "
+                        f"necesita {disponibilidad['tiempo_necesario_min']:.0f} min y solo "
+                        f"quedan {disponibilidad['libre_min']:.0f} min libres ese día. "
+                        "Puedes agregarlo igual si decides sobrevender a propósito."
                     )
-                    if col_btn.button("Quitar ítem", type="secondary"):
-                        try:
-                            mod_pedidos.quitar_item_pedido(pedido_id, opciones_quitar[nombre_a_quitar])
-                            st.success(f"'{nombre_a_quitar}' quitado del pedido.")
-                            st.rerun()
-                        except Exception as e:
-                            mostrar_error(e)
 
-    with tab_detalle:
-        opciones_estado_detalle = list(mod_pedidos.ESTADOS_VALIDOS) + ["(todos)"]
-        estado_filtro_detalle = st.selectbox(
-            "Filtrar por estado", opciones_estado_detalle, index=0, key="detalle_filtro_estado"
-        )
-        pedido_id = selector_pedido(
-            "Pedido", "sel_pedido_detalle",
-            estado=None if estado_filtro_detalle == "(todos)" else estado_filtro_detalle,
-        )
-        if pedido_id is not None:
-            pedido = mod_pedidos.detalle_pedido(pedido_id)
+                if st.button("Agregar/actualizar ítem"):
+                    try:
+                        mod_pedidos.agregar_item_pedido(pedido_id, receta_id, cantidad)
+                        st.toast("Ítem agregado/actualizado en el pedido.")
+                        st.rerun()
+                    except Exception as e:
+                        mostrar_error(e)
 
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Cliente", pedido["cliente_nombre"])
-            col2.metric("Fecha de entrega", pedido["fecha_entrega"])
-            col3.metric("Total", f"${pedido['total']:.2f}")
-            st.caption(f"Estado: {pedido['estado']} · Pagado: {'sí' if pedido['pagado'] else 'no'}")
-            if pedido["notas"]:
-                st.caption(f"Notas: {pedido['notas']}")
-
+            # 3. Ítem para quitar
             if pedido["items"]:
-                st.dataframe(pd.DataFrame(pedido["items"]), width='stretch', hide_index=True)
-
-                st.subheader("Resumen para WhatsApp")
-                st.caption("Cópialo y pégalo en el chat del cliente para confirmar el pedido.")
-                st.code(mod_pedidos.generar_resumen_whatsapp(pedido_id), language=None)
-            else:
-                st.info("Este pedido todavía no tiene ítems.")
-
-            if pedido["estado"] not in ("entregado", "cancelado"):
-                st.subheader("Reagendar")
-                st.caption("Cambia la fecha de entrega sin perder el pedido, sus ítems ni su estado.")
-                with st.form("form_reagendar_pedido"):
-                    nueva_fecha = st.date_input(
-                        "Nueva fecha de entrega",
-                        value=date.fromisoformat(pedido["fecha_entrega"]),
-                    )
-                    enviado = st.form_submit_button("Reagendar pedido")
-                if enviado:
-                    try:
-                        mod_pedidos.reagendar_pedido(pedido_id, nueva_fecha.isoformat())
-                        st.success(f"Pedido #{pedido_id} reagendado al {nueva_fecha.isoformat()}.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
-
-                if pedido["estado"] == "pendiente":
-                    st.divider()
-                    st.subheader("Confirmar pedido")
-                    st.caption("Marca el pedido como confirmado con el cliente (sin cobrarlo todavía).")
-                    if st.button("Confirmar pedido"):
-                        try:
-                            mod_pedidos.actualizar_estado(pedido_id, "confirmado")
-                            st.success(f"Pedido #{pedido_id} confirmado.")
-                            st.rerun()
-                        except Exception as e:
-                            mostrar_error(e)
-
                 st.divider()
-                st.subheader("Entregar y cobrar")
-                st.caption("Marca el pedido como entregado y genera el ingreso en Flujo de caja automáticamente.")
-
-                st.caption("Mensaje para avisar la entrega y el monto a pagar:")
-                st.code(mod_pedidos.generar_mensaje_cobro_whatsapp(pedido_id), language=None)
-
-                with st.expander("Si el cliente va a transferir: datos para copiar"):
-                    datos_transferencia = st.secrets.get("datos_transferencia")
-                    if datos_transferencia:
-                        mensaje_transferencia = mod_pedidos.generar_mensaje_datos_transferencia_whatsapp(
-                            datos_transferencia["nombre"],
-                            datos_transferencia["rut"],
-                            datos_transferencia["tipo_cuenta"],
-                            datos_transferencia["numero_cuenta"],
-                            datos_transferencia["email"],
-                        )
-                        st.code(mensaje_transferencia, language=None)
-                    else:
-                        st.warning(
-                            "Configura tus datos de transferencia en .streamlit/secrets.toml "
-                            "(sección [datos_transferencia]) para que aparezcan aquí."
-                        )
-
-                with st.form("form_cobrar_pedido"):
-                    medio = st.selectbox("Medio de pago", mod_caja.MEDIOS_VALIDOS)
-                    enviado = st.form_submit_button("Marcar entregado y cobrado")
-                if enviado:
-                    try:
-                        resultado = mod_pedidos.entregar_y_cobrar(pedido_id, medio)
-                        mensaje = (
-                            f"Pedido entregado y cobrado. Ingreso "
-                            f"#{resultado['movimiento_ingreso_id']} registrado en Caja."
-                        )
-                        if resultado["comision"] > 0:
-                            mensaje += (
-                                f" Se registró además un gasto de ${resultado['comision']:.2f} "
-                                f"por comisión de {medio} (#{resultado['movimiento_gasto_comision_id']})."
-                            )
-                        st.success(mensaje)
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
-
-                st.divider()
-                if st.button("Cancelar pedido", type="secondary"):
-                    try:
-                        mod_pedidos.cancelar_pedido(pedido_id)
-                        st.success("Pedido cancelado.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
-
-            st.divider()
-            st.subheader("Eliminar pedido")
-            st.caption(
-                "Para pedidos mal tomados o de prueba: borra el pedido y sus ítems por completo "
-                "(a diferencia de Cancelar, no queda registro). No se puede si ya fue cobrado."
-            )
-            if pedido["pagado"]:
-                st.warning(
-                    "Este pedido ya fue cobrado y generó un ingreso en Flujo de caja. "
-                    "Anula ese movimiento en Caja primero si de verdad quieres eliminarlo, "
-                    "o usa 'Cancelar pedido' en su lugar."
+                col_sel, col_btn = st.columns([3, 1], vertical_alignment="bottom")
+                opciones_quitar = {i["nombre"]: i["receta_id"] for i in pedido["items"]}
+                nombre_a_quitar = col_sel.selectbox(
+                    "Ítem para quitar", list(opciones_quitar.keys()), key="sel_quitar_item_pedido"
                 )
-            else:
-                confirmar_eliminar = st.checkbox(
-                    f"Confirmo que quiero eliminar el pedido #{pedido_id} definitivamente"
-                )
-                if st.button("Eliminar pedido", type="secondary", disabled=not confirmar_eliminar):
-                    try:
-                        mod_pedidos.eliminar_pedido(pedido_id)
-                        st.success(f"Pedido #{pedido_id} eliminado.")
-                        st.rerun()
-                    except Exception as e:
-                        mostrar_error(e)
+                if col_btn.button("Quitar ítem", type="secondary"):
+                    _confirmar_quitar_item(pedido, opciones_quitar[nombre_a_quitar], nombre_a_quitar)
 
-    with tab_capacidad:
+    elif vista == "Línea de producción":
+        _vista_linea_produccion()
+
+    elif vista == "Capacidad de producción":
         config = mod_prod.obtener_configuracion()
         with st.form("form_capacidad"):
             horas = st.number_input(
@@ -1027,11 +1973,18 @@ def seccion_pedidos():
 
 def seccion_clientes():
     st.header("👥 Clientes")
-    tab_listado, tab_agregar, tab_ficha, tab_reportes = st.tabs(
-        ["Listado", "Agregar", "Ficha / Historial", "Reportes"]
+    # Selector en vez de st.tabs: st.tabs ejecuta el contenido de TODAS las
+    # pestañas en cada interacción, y contra Supabase eso son consultas de
+    # más por click. Con este selector solo corre la sección activa.
+    vista = st.radio(
+        "Sección",
+        ["Listado", "Agregar", "Ficha / Historial", "Reportes"],
+        horizontal=True,
+        label_visibility="collapsed",
+        key="vista_clientes",
     )
 
-    with tab_listado:
+    if vista == "Listado":
         clientes = mod_clientes.listar_clientes()
         if not clientes:
             st.info("No hay clientes registrados todavía.")
@@ -1039,7 +1992,7 @@ def seccion_clientes():
             df = pd.DataFrame(clientes)[["id", "nombre", "telefono", "direccion", "fecha_creacion"]]
             st.dataframe(df, width='stretch', hide_index=True)
 
-    with tab_agregar:
+    elif vista == "Agregar":
         with st.form("form_agregar_cliente", clear_on_submit=True):
             nombre = st.text_input("Nombre")
             telefono = st.text_input("Teléfono (opcional)")
@@ -1053,7 +2006,7 @@ def seccion_clientes():
             except Exception as e:
                 mostrar_error(e)
 
-    with tab_ficha:
+    elif vista == "Ficha / Historial":
         cliente_id = selector_cliente("Cliente", "sel_cliente_ficha")
         if cliente_id is not None:
             hist = mod_clientes.historial_cliente(cliente_id)
@@ -1090,7 +2043,7 @@ def seccion_clientes():
             else:
                 st.info("Este cliente todavía no tiene pedidos.")
 
-    with tab_reportes:
+    elif vista == "Reportes":
         col_izq, col_der = st.columns(2)
         with col_izq:
             st.subheader("Quién compra más")
@@ -1131,10 +2084,9 @@ def seccion_dashboard():
 
     anio_ant, mes_ant = mod_dash.mes_anterior(anio, mes)
 
-    ped = mod_dash.resumen_pedidos_mes(anio, mes)
-    ped_ant = mod_dash.resumen_pedidos_mes(anio_ant, mes_ant)
-    fin = mod_dash.resumen_financiero_mes(anio, mes)
-    fin_ant = mod_dash.resumen_financiero_mes(anio_ant, mes_ant)
+    datos = mod_dash.datos_dashboard(int(anio), int(mes))
+    ped, ped_ant = datos["pedidos"], datos["pedidos_anterior"]
+    fin, fin_ant = datos["financiero"], datos["financiero_anterior"]
 
     st.caption(
         f"{NOMBRES_MESES[mes - 1]} {anio} · comparado contra "
@@ -1167,11 +2119,11 @@ def seccion_dashboard():
 
         st.subheader("Pedidos por estado")
         df_estado = pd.DataFrame(
-            [{"estado": e, "cantidad": c} for e, c in ped["por_estado"].items()]
+            [{"estado": mod_pedidos.etiqueta_estado(e), "cantidad": c} for e, c in ped["por_estado"].items()]
         ).set_index("estado")
         st.bar_chart(df_estado["cantidad"])
 
-    bajo_margen = mod_dash.recetas_bajo_margen()
+    bajo_margen = datos["recetas_bajo_margen"]
     if bajo_margen:
         nombres = ", ".join(r["nombre"] for r in bajo_margen)
         st.warning(f"⚠ {len(bajo_margen)} receta(s) por debajo de su margen objetivo: {nombres}")
@@ -1185,14 +2137,14 @@ def seccion_dashboard():
     col_izq, col_der = st.columns(2)
     with col_izq:
         st.markdown("**Más vendidos (unidades)**")
-        ranking_ventas = mod_dash.ranking_productos_mes(anio, mes)
+        ranking_ventas = datos["ranking_ventas"]
         if not ranking_ventas:
             st.info("Sin ventas este mes.")
         else:
             st.dataframe(pd.DataFrame(ranking_ventas), width='stretch', hide_index=True)
     with col_der:
         st.markdown("**Más rentables (ganancia estimada)**")
-        ranking_rentabilidad = mod_dash.rentabilidad_productos_mes(anio, mes)
+        ranking_rentabilidad = datos["ranking_rentabilidad"]
         if not ranking_rentabilidad:
             st.info("Sin ventas este mes.")
         else:
@@ -1211,15 +2163,18 @@ def seccion_dashboard():
 # --- Navegación principal ------------------------------------------------
 
 st.sidebar.title("🥖 Panadería")
+auth.mostrar_sesion_activa()
 seccion = st.sidebar.radio(
     "Módulo",
-    ["Dashboard", "Ingredientes", "Recetas", "Flujo de caja", "Costos indirectos", "Pedidos", "Clientes"],
+    ["Dashboard", "Ingredientes", "Stock", "Recetas", "Flujo de caja", "Costos indirectos", "Pedidos", "Clientes"],
 )
 
 if seccion == "Dashboard":
     seccion_dashboard()
 elif seccion == "Ingredientes":
     seccion_ingredientes()
+elif seccion == "Stock":
+    seccion_stock()
 elif seccion == "Recetas":
     seccion_recetas()
 elif seccion == "Flujo de caja":

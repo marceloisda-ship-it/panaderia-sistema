@@ -14,9 +14,10 @@ no bloquea nada — la decisión de sobrevender o no queda en manos del
 usuario (ver pedidos.py y app.py).
 """
 
-from db import conectar
+from db import conectar, cache_lectura
 
 
+@cache_lectura
 def obtener_configuracion() -> dict:
     """Retorna la configuración actual de capacidad diaria."""
     conn = conectar()
@@ -35,7 +36,7 @@ def actualizar_configuracion(horas_disponibles_dia: float) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE configuracion_produccion SET horas_disponibles_dia = ? WHERE id = 1",
+            "UPDATE configuracion_produccion SET horas_disponibles_dia = %s WHERE id = 1",
             (horas_disponibles_dia,),
         )
         conn.commit()
@@ -43,6 +44,7 @@ def actualizar_configuracion(horas_disponibles_dia: float) -> None:
         conn.close()
 
 
+@cache_lectura
 def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) -> float:
     """Minutos de preparación ya comprometidos por pedidos no cancelados
     con fecha_entrega = fecha. `excluir_pedido_id` permite recalcular al
@@ -52,11 +54,11 @@ def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) ->
         FROM pedido_items pi
         JOIN pedidos p ON p.id = pi.pedido_id
         JOIN recetas r ON r.id = pi.receta_id
-        WHERE p.fecha_entrega = ? AND p.estado != 'cancelado'
+        WHERE p.fecha_entrega = %s AND p.estado != 'cancelado'
     """
     parametros = [fecha]
     if excluir_pedido_id is not None:
-        query += " AND p.id != ?"
+        query += " AND p.id != %s"
         parametros.append(excluir_pedido_id)
 
     conn = conectar()
@@ -70,6 +72,33 @@ def tiempo_comprometido_dia(fecha: str, excluir_pedido_id: int | None = None) ->
         if f["unidades_por_lote"] > 0:
             total_min += (f["tiempo_preparacion_min"] / f["unidades_por_lote"]) * f["cantidad"]
     return total_min
+
+
+@cache_lectura
+def tiempo_comprometido_rango(desde: str, hasta: str) -> dict[str, float]:
+    """Minutos de preparación comprometidos por día (pedidos no cancelados)
+    entre `desde` y `hasta` inclusive, en una sola consulta. Retorna
+    {fecha_iso: minutos}; los días sin pedidos no aparecen."""
+    conn = conectar()
+    try:
+        filas = conn.execute(
+            """SELECT p.fecha_entrega, pi.cantidad, r.tiempo_preparacion_min, r.unidades_por_lote
+               FROM pedido_items pi
+               JOIN pedidos p ON p.id = pi.pedido_id
+               JOIN recetas r ON r.id = pi.receta_id
+               WHERE p.fecha_entrega >= %s AND p.fecha_entrega <= %s
+                 AND p.estado != 'cancelado'""",
+            (desde, hasta),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    por_dia: dict[str, float] = {}
+    for f in filas:
+        if f["unidades_por_lote"] > 0:
+            minutos = (f["tiempo_preparacion_min"] / f["unidades_por_lote"]) * f["cantidad"]
+            por_dia[str(f["fecha_entrega"])] = por_dia.get(str(f["fecha_entrega"]), 0.0) + minutos
+    return por_dia
 
 
 def capacidad_dia(fecha: str) -> dict:
@@ -87,6 +116,7 @@ def capacidad_dia(fecha: str) -> dict:
     }
 
 
+@cache_lectura
 def verificar_disponibilidad(fecha: str, receta_id: int, cantidad: float,
                               excluir_pedido_id: int | None = None) -> dict:
     """Indica si agregar `cantidad` unidades de una receta a una fecha
@@ -96,7 +126,7 @@ def verificar_disponibilidad(fecha: str, receta_id: int, cantidad: float,
     conn = conectar()
     try:
         receta = conn.execute(
-            "SELECT tiempo_preparacion_min, unidades_por_lote FROM recetas WHERE id = ?",
+            "SELECT tiempo_preparacion_min, unidades_por_lote FROM recetas WHERE id = %s",
             (receta_id,),
         ).fetchone()
     finally:

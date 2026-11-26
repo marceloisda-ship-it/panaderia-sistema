@@ -10,7 +10,7 @@ haciendo join contra `pedidos` y `pedido_items`.
 """
 
 from datetime import datetime
-from db import conectar
+from db import conectar, cache_lectura
 
 
 def crear_cliente(nombre: str, telefono: str | None = None,
@@ -24,11 +24,13 @@ def crear_cliente(nombre: str, telefono: str | None = None,
         cursor = conn.cursor()
         cursor.execute(
             """INSERT INTO clientes (nombre, telefono, direccion, notas, fecha_creacion)
-               VALUES (?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s)
+               RETURNING id""",
             (nombre.strip(), telefono or None, direccion or None, notas or None, fecha_creacion),
         )
+        cliente_id = cursor.fetchone()["id"]
         conn.commit()
-        return cursor.lastrowid
+        return cliente_id
     finally:
         conn.close()
 
@@ -40,11 +42,12 @@ def actualizar_cliente(cliente_id: int, nombre: str, telefono: str | None = None
     conn = conectar()
     try:
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM clientes WHERE id = ?", (cliente_id,))
+        cursor.execute("SELECT id FROM clientes WHERE id = %s", (cliente_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un cliente con id {cliente_id}")
         cursor.execute(
-            "UPDATE clientes SET nombre = ?, telefono = ?, direccion = ?, notas = ? WHERE id = ?",
+            """UPDATE clientes SET nombre = %s, telefono = %s, direccion = %s, notas = %s
+               WHERE id = %s""",
             (nombre.strip(), telefono or None, direccion or None, notas or None, cliente_id),
         )
         conn.commit()
@@ -52,6 +55,7 @@ def actualizar_cliente(cliente_id: int, nombre: str, telefono: str | None = None
         conn.close()
 
 
+@cache_lectura
 def listar_clientes() -> list[dict]:
     conn = conectar()
     try:
@@ -62,12 +66,13 @@ def listar_clientes() -> list[dict]:
 
 
 def _obtener_cliente(conn, cliente_id: int) -> dict:
-    fila = conn.execute("SELECT * FROM clientes WHERE id = ?", (cliente_id,)).fetchone()
+    fila = conn.execute("SELECT * FROM clientes WHERE id = %s", (cliente_id,)).fetchone()
     if fila is None:
         raise ValueError(f"No existe un cliente con id {cliente_id}")
     return dict(fila)
 
 
+@cache_lectura
 def historial_cliente(cliente_id: int) -> dict:
     """Ficha completa de un cliente: sus datos, su historial de pedidos
     y métricas simples (cantidad de pedidos, total gastado, receta
@@ -81,7 +86,7 @@ def historial_cliente(cliente_id: int) -> dict:
                       COALESCE(SUM(pi.cantidad * pi.precio_unitario), 0) AS total
                FROM pedidos p
                LEFT JOIN pedido_items pi ON pi.pedido_id = p.id
-               WHERE p.cliente_id = ?
+               WHERE p.cliente_id = %s
                GROUP BY p.id
                ORDER BY p.fecha_entrega DESC""",
             (cliente_id,),
@@ -92,7 +97,7 @@ def historial_cliente(cliente_id: int) -> dict:
                FROM pedido_items pi
                JOIN pedidos p ON p.id = pi.pedido_id
                JOIN recetas r ON r.id = pi.receta_id
-               WHERE p.cliente_id = ? AND p.estado != 'cancelado'
+               WHERE p.cliente_id = %s AND p.estado != 'cancelado'
                GROUP BY r.id
                ORDER BY unidades DESC
                LIMIT 1""",
@@ -118,6 +123,7 @@ def historial_cliente(cliente_id: int) -> dict:
     return cliente
 
 
+@cache_lectura
 def reporte_top_clientes(limite: int = 10) -> list[dict]:
     """Ranking de clientes por total gastado (solo pedidos pagados y no
     cancelados). Responde "quién compra más"."""
@@ -128,11 +134,11 @@ def reporte_top_clientes(limite: int = 10) -> list[dict]:
                       COUNT(DISTINCT p.id) AS cantidad_pedidos,
                       COALESCE(SUM(pi.cantidad * pi.precio_unitario), 0) AS total_gastado
                FROM clientes c
-               JOIN pedidos p ON p.cliente_id = c.id AND p.pagado = 1 AND p.estado != 'cancelado'
+               JOIN pedidos p ON p.cliente_id = c.id AND p.pagado = TRUE AND p.estado != 'cancelado'
                JOIN pedido_items pi ON pi.pedido_id = p.id
                GROUP BY c.id
                ORDER BY total_gastado DESC
-               LIMIT ?""",
+               LIMIT %s""",
             (limite,),
         ).fetchall()
     finally:

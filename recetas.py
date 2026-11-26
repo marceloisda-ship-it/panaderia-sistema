@@ -8,7 +8,8 @@ precio de venta.
 Concepto clave — el costo final de una receta tiene tres componentes:
     costo_directo    = suma( cantidad_ingrediente * precio_actual_ingrediente )
     costo_indirecto  = costo_luz                          (consumo del programa de esta receta x tarifa, ver costos_indirectos.py)
-                      + costo_empaque_unidad               (fijo, igual para todas las recetas)
+                      + costo_empaque                      (precio de la bolsa asignada a la receta; si no tiene,
+                                                            el costo_empaque_unidad fijo de costos_indirectos.py)
                       + costo_mano_obra                     (tiempo de esta receta x tu valor hora)
     costo_total      = costo_directo + costo_indirecto
     margen_real      = (precio_venta - costo_total) / precio_venta
@@ -29,7 +30,7 @@ un pan dejó de ser rentable por la subida de algún insumo o de los
 costos indirectos.
 """
 
-from db import conectar
+from db import conectar, cache_lectura
 import costos_indirectos
 
 
@@ -54,12 +55,14 @@ def crear_receta(nombre: str, precio_venta: float, margen_objetivo: float = 0.4,
         cursor.execute(
             """INSERT INTO recetas (nombre, precio_venta, margen_objetivo, notas,
                                      tiempo_preparacion_min, unidades_por_lote, consumo_kwh_programa)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (%s, %s, %s, %s, %s, %s, %s)
+               RETURNING id""",
             (nombre, precio_venta, margen_objetivo, notas, tiempo_preparacion_min,
              unidades_por_lote, consumo_kwh_programa),
         )
+        receta_id = cursor.fetchone()["id"]
         conn.commit()
-        return cursor.lastrowid
+        return receta_id
     finally:
         conn.close()
 
@@ -75,7 +78,7 @@ def actualizar_mano_obra(receta_id: int, tiempo_preparacion_min: float, unidades
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE recetas SET tiempo_preparacion_min = ?, unidades_por_lote = ? WHERE id = ?",
+            "UPDATE recetas SET tiempo_preparacion_min = %s, unidades_por_lote = %s WHERE id = %s",
             (tiempo_preparacion_min, unidades_por_lote, receta_id),
         )
         conn.commit()
@@ -92,10 +95,41 @@ def actualizar_luz(receta_id: int, consumo_kwh_programa: float) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "UPDATE recetas SET consumo_kwh_programa = ? WHERE id = ?",
+            "UPDATE recetas SET consumo_kwh_programa = %s WHERE id = %s",
             (consumo_kwh_programa, receta_id),
         )
         conn.commit()
+    finally:
+        conn.close()
+
+
+def actualizar_empaque(receta_id: int, ingrediente_id: int | None) -> None:
+    """Asigna la bolsa (un insumo de categoría 'empaque', en 'unidad')
+    que usa esta receta, 1 por unidad vendida; su precio pasa a ser el costo
+    de empaque de la receta y se descuenta del stock con cada pedido. Con
+    None se quita y vuelve a aplicar el empaque fijo de Costos indirectos."""
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        if ingrediente_id is not None:
+            cursor.execute(
+                "SELECT unidad_base, tipo, categoria FROM ingredientes WHERE id = %s", (ingrediente_id,)
+            )
+            fila = cursor.fetchone()
+            if fila is None:
+                raise ValueError(f"No existe un ingrediente con id {ingrediente_id}")
+            if fila["tipo"] != "insumo" or fila["categoria"] != "empaque":
+                raise ValueError("El empaque debe ser un insumo de categoría 'empaque' (se configura en Stock → Configurar)")
+            if fila["unidad_base"] != "unidad":
+                raise ValueError("El empaque debe estar en 'unidad' (se usa 1 por pan vendido)")
+        cursor.execute(
+            "UPDATE recetas SET empaque_ingrediente_id = %s WHERE id = %s",
+            (ingrediente_id, receta_id),
+        )
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
     finally:
         conn.close()
 
@@ -112,8 +146,8 @@ def agregar_ingrediente_a_receta(receta_id: int, ingrediente_id: int, cantidad: 
     try:
         conn.execute(
             """INSERT INTO receta_ingredientes (receta_id, ingrediente_id, cantidad)
-               VALUES (?, ?, ?)
-               ON CONFLICT(receta_id, ingrediente_id)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (receta_id, ingrediente_id)
                DO UPDATE SET cantidad = excluded.cantidad""",
             (receta_id, ingrediente_id, cantidad),
         )
@@ -127,7 +161,7 @@ def quitar_ingrediente_de_receta(receta_id: int, ingrediente_id: int) -> None:
     conn = conectar()
     try:
         conn.execute(
-            "DELETE FROM receta_ingredientes WHERE receta_id = ? AND ingrediente_id = ?",
+            "DELETE FROM receta_ingredientes WHERE receta_id = %s AND ingrediente_id = %s",
             (receta_id, ingrediente_id),
         )
         conn.commit()
@@ -136,12 +170,88 @@ def quitar_ingrediente_de_receta(receta_id: int, ingrediente_id: int) -> None:
 
 
 def _obtener_receta(conn, receta_id: int) -> dict:
-    fila = conn.execute("SELECT * FROM recetas WHERE id = ?", (receta_id,)).fetchone()
+    fila = conn.execute(
+        """SELECT r.*, e.nombre AS empaque_nombre, e.precio_actual AS empaque_precio
+           FROM recetas r
+           LEFT JOIN ingredientes e ON e.id = r.empaque_ingrediente_id
+           WHERE r.id = %s""",
+        (receta_id,),
+    ).fetchone()
     if fila is None:
         raise ValueError(f"No existe una receta con id {receta_id}")
     return dict(fila)
 
 
+def _calcular_costo(receta: dict, filas_ingredientes: list, config: dict) -> dict:
+    """Cálculo puro (sin acceso a datos) del costo/margen de una receta a
+    partir de sus filas de ingredientes y la configuración de costos
+    indirectos ya traídas. Separado de `detalle_receta`/`listar_recetas`
+    para poder traer los datos de a una receta (lookup individual) o de
+    todas de una vez (listado, evitando N+1 contra Supabase)."""
+    ingredientes = []
+    costo_directo = 0.0
+    for f in filas_ingredientes:
+        subtotal = f["cantidad"] * f["precio_actual"]
+        costo_directo += subtotal
+        ingredientes.append({
+            "nombre": f["nombre"],
+            "cantidad": f["cantidad"],
+            "unidad_base": f["unidad_base"],
+            "precio_unitario": f["precio_actual"],
+            "subtotal": round(subtotal, 2),
+        })
+
+    # La luz NO se divide por unidades_por_lote: cada pan se hornea en su
+    # propia panificadora con su propio ciclo completo, así que el
+    # consumo eléctrico no se abarata por preparar varios panes en la
+    # misma sesión de trabajo (a diferencia de la mano de obra, que sí
+    # se reparte porque el tiempo activo de preparación es compartido).
+    costo_indirecto_luz = (
+        receta["consumo_kwh_programa"] * config["tarifa_electrica_kwh"] * config["factor_descuento_luz"]
+    )
+    # Con bolsa asignada manda su precio (una bolsa plástica y una de papel
+    # no cuestan lo mismo); sin bolsa, el empaque fijo de la configuración.
+    if receta.get("empaque_ingrediente_id") is not None:
+        costo_empaque = receta["empaque_precio"]
+    else:
+        costo_empaque = config["costo_empaque_unidad"]
+    costo_mano_obra = (
+        receta["tiempo_preparacion_min"] / 60 * config["valor_hora_mano_obra"]
+        / receta["unidades_por_lote"]
+    )
+    costo_total = costo_directo + costo_indirecto_luz + costo_empaque + costo_mano_obra
+
+    precio_venta = receta["precio_venta"]
+    if precio_venta > 0:
+        margen_real = (precio_venta - costo_total) / precio_venta
+    else:
+        margen_real = 0.0
+
+    return {
+        "id": receta["id"],
+        "nombre": receta["nombre"],
+        "precio_venta": precio_venta,
+        "margen_objetivo": receta["margen_objetivo"],
+        "activo": bool(receta["activo"]),
+        "notas": receta["notas"],
+        "tiempo_preparacion_min": receta["tiempo_preparacion_min"],
+        "unidades_por_lote": receta["unidades_por_lote"],
+        "consumo_kwh_programa": receta["consumo_kwh_programa"],
+        "empaque_ingrediente_id": receta.get("empaque_ingrediente_id"),
+        "empaque_nombre": receta.get("empaque_nombre"),
+        "ingredientes": ingredientes,
+        "costo_directo": round(costo_directo, 2),
+        "costo_indirecto_luz": round(costo_indirecto_luz, 2),
+        "costo_empaque": round(costo_empaque, 2),
+        "costo_mano_obra": round(costo_mano_obra, 2),
+        "costo_total": round(costo_total, 2),
+        "ganancia": round(precio_venta - costo_total, 2),
+        "margen_real": round(margen_real, 4),
+        "bajo_margen": margen_real < receta["margen_objetivo"],
+    }
+
+
+@cache_lectura
 def detalle_receta(receta_id: int) -> dict:
     """Retorna el detalle completo de una receta: datos generales,
     lista de ingredientes, desglose de costo directo e indirecto,
@@ -154,84 +264,76 @@ def detalle_receta(receta_id: int) -> dict:
             """SELECT i.nombre, i.unidad_base, i.precio_actual, ri.cantidad
                FROM receta_ingredientes ri
                JOIN ingredientes i ON i.id = ri.ingrediente_id
-               WHERE ri.receta_id = ?
+               WHERE ri.receta_id = %s
                ORDER BY i.nombre ASC""",
             (receta_id,),
         ).fetchall()
-
-        ingredientes = []
-        costo_directo = 0.0
-        for f in filas:
-            subtotal = f["cantidad"] * f["precio_actual"]
-            costo_directo += subtotal
-            ingredientes.append({
-                "nombre": f["nombre"],
-                "cantidad": f["cantidad"],
-                "unidad_base": f["unidad_base"],
-                "precio_unitario": f["precio_actual"],
-                "subtotal": round(subtotal, 2),
-            })
-
-        config = costos_indirectos.obtener_configuracion()
-        # La luz NO se divide por unidades_por_lote: cada pan se hornea en su
-        # propia panificadora con su propio ciclo completo, así que el
-        # consumo eléctrico no se abarata por preparar varios panes en la
-        # misma sesión de trabajo (a diferencia de la mano de obra, que sí
-        # se reparte porque el tiempo activo de preparación es compartido).
-        costo_indirecto_luz = (
-            receta["consumo_kwh_programa"] * config["tarifa_electrica_kwh"] * config["factor_descuento_luz"]
-        )
-        costo_empaque = config["costo_empaque_unidad"]
-        costo_mano_obra = (
-            receta["tiempo_preparacion_min"] / 60 * config["valor_hora_mano_obra"]
-            / receta["unidades_por_lote"]
-        )
-        costo_total = costo_directo + costo_indirecto_luz + costo_empaque + costo_mano_obra
-
-        precio_venta = receta["precio_venta"]
-        if precio_venta > 0:
-            margen_real = (precio_venta - costo_total) / precio_venta
-        else:
-            margen_real = 0.0
-
-        return {
-            "id": receta["id"],
-            "nombre": receta["nombre"],
-            "precio_venta": precio_venta,
-            "margen_objetivo": receta["margen_objetivo"],
-            "activo": bool(receta["activo"]),
-            "notas": receta["notas"],
-            "tiempo_preparacion_min": receta["tiempo_preparacion_min"],
-            "unidades_por_lote": receta["unidades_por_lote"],
-            "consumo_kwh_programa": receta["consumo_kwh_programa"],
-            "ingredientes": ingredientes,
-            "costo_directo": round(costo_directo, 2),
-            "costo_indirecto_luz": round(costo_indirecto_luz, 2),
-            "costo_empaque": round(costo_empaque, 2),
-            "costo_mano_obra": round(costo_mano_obra, 2),
-            "costo_total": round(costo_total, 2),
-            "ganancia": round(precio_venta - costo_total, 2),
-            "margen_real": round(margen_real, 4),
-            "bajo_margen": margen_real < receta["margen_objetivo"],
-        }
     finally:
         conn.close()
 
+    config = costos_indirectos.obtener_configuracion()
+    return _calcular_costo(receta, filas, config)
 
+
+@cache_lectura
 def listar_recetas(solo_activas: bool = True) -> list[dict]:
     """Retorna todas las recetas con su costo y margen ya calculados.
-    Útil para el reporte general de rentabilidad."""
+    Útil para el reporte general de rentabilidad.
+
+    Trae las recetas y sus ingredientes en 2 consultas (no 1 por receta) y
+    reutiliza una sola conexión — con SQLite local esto no importaba, pero
+    contra Supabase cada conexión de más suma latencia de red real."""
+    query = """SELECT r.*, e.nombre AS empaque_nombre, e.precio_actual AS empaque_precio
+               FROM recetas r
+               LEFT JOIN ingredientes e ON e.id = r.empaque_ingrediente_id"""
+    if solo_activas:
+        query += " WHERE r.activo = TRUE"
+    query += " ORDER BY r.nombre ASC"
+
     conn = conectar()
     try:
-        query = "SELECT id FROM recetas"
-        if solo_activas:
-            query += " WHERE activo = 1"
-        query += " ORDER BY nombre ASC"
-        ids = [f["id"] for f in conn.execute(query).fetchall()]
+        recetas = [dict(f) for f in conn.execute(query).fetchall()]
+        ids = [r["id"] for r in recetas]
+
+        ingredientes_por_receta = {rid: [] for rid in ids}
+        if ids:
+            filas = conn.execute(
+                """SELECT ri.receta_id, i.nombre, i.unidad_base, i.precio_actual, ri.cantidad
+                   FROM receta_ingredientes ri
+                   JOIN ingredientes i ON i.id = ri.ingrediente_id
+                   WHERE ri.receta_id = ANY(%s)
+                   ORDER BY i.nombre ASC""",
+                (ids,),
+            ).fetchall()
+            for f in filas:
+                ingredientes_por_receta[f["receta_id"]].append(f)
     finally:
         conn.close()
 
-    return [detalle_receta(receta_id) for receta_id in ids]
+    config = costos_indirectos.obtener_configuracion()
+    return [_calcular_costo(r, ingredientes_por_receta[r["id"]], config) for r in recetas]
+
+
+@cache_lectura
+def listar_recetas_resumen(solo_activas: bool = False) -> list[dict]:
+    """Retorna solo id y nombre de cada receta, sin calcular costo/margen.
+
+    Pensada para selectores/desplegables (ej. elegir una receta en un
+    formulario), que no necesitan el costeo completo. `listar_recetas()`
+    trae ingredientes y hace el cálculo de costo de cada receta — correcto
+    para el reporte de rentabilidad, pero muy caro para solo mostrar
+    nombres en un `st.selectbox` (cada connect/query de más contra Supabase
+    suma latencia real de red)."""
+    query = "SELECT id, nombre FROM recetas"
+    if solo_activas:
+        query += " WHERE activo = TRUE"
+    query += " ORDER BY nombre ASC"
+
+    conn = conectar()
+    try:
+        return [dict(f) for f in conn.execute(query).fetchall()]
+    finally:
+        conn.close()
 
 
 def actualizar_precio_venta(receta_id: int, nuevo_precio: float) -> None:
@@ -240,7 +342,7 @@ def actualizar_precio_venta(receta_id: int, nuevo_precio: float) -> None:
         raise ValueError("El precio de venta no puede ser negativo")
     conn = conectar()
     try:
-        conn.execute("UPDATE recetas SET precio_venta = ? WHERE id = ?", (nuevo_precio, receta_id))
+        conn.execute("UPDATE recetas SET precio_venta = %s WHERE id = %s", (nuevo_precio, receta_id))
         conn.commit()
     finally:
         conn.close()
@@ -252,7 +354,7 @@ def actualizar_margen_objetivo(receta_id: int, nuevo_margen: float) -> None:
         raise ValueError("El margen debe ser un valor entre 0 y 1 (ej. 0.4 = 40%)")
     conn = conectar()
     try:
-        conn.execute("UPDATE recetas SET margen_objetivo = ? WHERE id = ?", (nuevo_margen, receta_id))
+        conn.execute("UPDATE recetas SET margen_objetivo = %s WHERE id = %s", (nuevo_margen, receta_id))
         conn.commit()
     finally:
         conn.close()

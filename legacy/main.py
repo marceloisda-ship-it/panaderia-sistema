@@ -1,11 +1,12 @@
 """
-main.py
---------
-Punto de entrada del sistema. Menú de consola para gestionar
-ingredientes y recetas (Módulo de Costeo).
+legacy/main.py
+--------------
+Primera versión del sistema: menú de consola para gestionar ingredientes,
+recetas y flujo de caja. Se conserva como referencia histórica; la interfaz
+actual es la app en Streamlit (app.py) sobre Supabase.
 
-Para ejecutar:
-    python3 main.py
+Para ejecutar (desde la carpeta principal del proyecto):
+    python -m legacy.main
 """
 
 from datetime import date

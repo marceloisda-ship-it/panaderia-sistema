@@ -2,33 +2,122 @@
 db.py
 -----
 Módulo central de acceso a la base de datos del sistema de gestión
-de la panadería. Toda la aplicación usa una única base SQLite local
-llamada `panaderia.db`, ubicada en la misma carpeta que este archivo.
+de la panadería. La base de datos vive en Supabase (Postgres) para
+que el equipo pueda usar el sistema desde varios dispositivos a la vez.
 
-Diseño pensado para crecer: cada módulo futuro (caja, pedidos, clientes)
-agregará sus propias tablas aquí, pero todos comparten esta misma
-conexión y el mismo archivo de base de datos.
+La cadena de conexión se lee desde `st.secrets["postgres"]["url"]`
+(ver .streamlit/secrets.toml en desarrollo, o los "Secrets" del panel
+de Streamlit Community Cloud en producción) — nunca queda en el código.
+
+Las conexiones salen de un pool cacheado a nivel de proceso (no se abre
+una conexión TCP/TLS nueva contra Supabase en cada `conectar()`, que
+sale ~800ms por el handshake — con el pool baja a ~10-20ms).
 """
 
-import sqlite3
-from datetime import datetime
-from pathlib import Path
+import uuid
 
-# Ruta del archivo de base de datos (siempre junto a este script)
-DB_PATH = Path(__file__).parent / "panaderia.db"
+# Subir este número cada vez que inicializar_db() cambie el esquema
+# (tabla, columna o migración nueva). app.py lo usa como clave del caché
+# de la inicialización: Streamlit Cloud, al recibir un push, recarga el
+# código sin reiniciar el proceso, y sin esta clave el caché viejo hacía
+# que la migración nueva nunca corriera (pasó el 2026-11-04).
+VERSION_ESQUEMA = 5
+
+import streamlit as st
+import psycopg2
+import psycopg2.extras
+from psycopg2.pool import ThreadedConnectionPool
 
 
-def conectar() -> sqlite3.Connection:
-    """Abre y retorna una conexión a la base de datos SQLite.
+class _ConexionConExecute:
+    """Envuelve una conexión psycopg2 tomada del pool para agregarle un
+    método `.execute()` a nivel de conexión, igual que trae sqlite3
+    nativamente. psycopg2 solo permite ejecutar consultas desde un
+    cursor — sin este envoltorio, habría que reescribir cada
+    `conn.execute(...)` de los 8 módulos de negocio por
+    `cursor = conn.cursor(); cursor.execute(...)`. Todo lo demás
+    (placeholders %s, RETURNING en vez de lastrowid, etc.) sí hubo que
+    ajustarlo módulo por módulo — esto solo evita ese cambio en
+    particular, que era puramente mecánico.
 
-    Se activa el soporte de llaves foráneas (SQLite lo trae desactivado
-    por defecto) y se configura row_factory para poder acceder a las
-    columnas de los resultados por nombre (ej. fila["nombre"]).
+    `close()` no cierra la conexión TCP: la devuelve al pool para que
+    la reutilice el próximo `conectar()`. Antes de devolverla, hace
+    rollback por las dudas (si el caller ya hizo commit, es un no-op;
+    si quedó una transacción de solo lectura sin cerrar, la descarta),
+    para que la conexión vuelva al pool en estado limpio."""
+
+    def __init__(self, conn, pool, clave):
+        self._conn = conn
+        self._pool = pool
+        self._clave = clave
+
+    def execute(self, query, params=None):
+        cursor = self._conn.cursor()
+        cursor.execute(query, params or ())
+        return cursor
+
+    def cursor(self):
+        return self._conn.cursor()
+
+    def commit(self):
+        self._conn.commit()
+        # Toda escritura del sistema pasa por acá: al confirmarla se
+        # invalida el caché de lecturas (ver `cache_lectura`), así la
+        # próxima pantalla ya ve el dato nuevo. st.cache_data es global al
+        # proceso, así que esto también refresca a los demás usuarios
+        # conectados al mismo tiempo.
+        st.cache_data.clear()
+
+    def rollback(self):
+        self._conn.rollback()
+
+    def close(self):
+        try:
+            self._conn.rollback()
+        except psycopg2.Error:
+            pass
+        self._pool.putconn(self._conn, key=self._clave, close=self._conn.closed != 0)
+
+
+@st.cache_resource
+def _pool() -> ThreadedConnectionPool:
+    return ThreadedConnectionPool(
+        minconn=1,
+        maxconn=10,
+        dsn=st.secrets["postgres"]["url"],
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    )
+
+
+def conectar() -> _ConexionConExecute:
+    """Toma una conexión del pool (no abre una nueva contra Supabase
+    salvo que el pool todavía no tenga ninguna libre) y la retorna
+    envuelta para poder seguir usando `fila["campo"]` y `.execute()`
+    como con sqlite3.
+
+    Cada llamada usa una clave propia (no la comparte por hilo) para
+    que dos `conectar()` seguidos dentro del mismo render de Streamlit
+    tomen conexiones independientes del pool, sin pisarse si alguna
+    quedara abierta más tiempo que otra.
     """
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("PRAGMA foreign_keys = ON;")
-    conn.row_factory = sqlite3.Row
-    return conn
+    clave = uuid.uuid4().hex
+    conn = _pool().getconn(key=clave)
+    return _ConexionConExecute(conn, _pool(), clave)
+
+
+def cache_lectura(func):
+    """Decorador para las funciones de solo lectura de los módulos de
+    negocio. Streamlit re-ejecuta todo el script en cada click (cambiar
+    de pestaña, mover un slider, elegir una opción en un selectbox), y sin
+    caché cada rerun volvía a mandar todas las consultas de la pantalla a
+    Supabase — cada una es un viaje de red real, y desde el celular o la
+    tablet eso se nota todavía más.
+
+    El caché se vacía solo en cada `commit()` (ver `_ConexionConExecute`),
+    así que después de guardar algo nunca se muestra un dato viejo. El
+    `ttl` es solo un respaldo por si alguien edita la base por fuera de la
+    app (panel de Supabase, migrar_datos.py)."""
+    return st.cache_data(ttl=600, show_spinner=False)(func)
 
 
 def inicializar_db() -> None:
@@ -38,13 +127,16 @@ def inicializar_db() -> None:
     no borra ni duplica datos existentes.
     """
     conn = conectar()
-    cursor = conn.cursor()
+    # Todas las sentencias se mandan juntas en un solo execute(): contra
+    # Supabase cada execute es un viaje de red, y este arranque corre al
+    # despertar la app (cuando también hay que llenar el caché).
+    sentencias = []
 
     # --- Módulo de Costeo -------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS ingredientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL UNIQUE,
             unidad_base TEXT NOT NULL CHECK (unidad_base IN ('gr', 'ml', 'unidad')),
             precio_actual REAL NOT NULL CHECK (precio_actual >= 0),
@@ -53,65 +145,78 @@ def inicializar_db() -> None:
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS historial_precios_ingredientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ingrediente_id INTEGER NOT NULL,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            ingrediente_id INTEGER NOT NULL REFERENCES ingredientes(id) ON DELETE CASCADE,
             precio REAL NOT NULL,
-            fecha TEXT NOT NULL,
-            FOREIGN KEY (ingrediente_id) REFERENCES ingredientes(id) ON DELETE CASCADE
+            fecha TEXT NOT NULL
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS recetas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL UNIQUE,
             precio_venta REAL NOT NULL CHECK (precio_venta >= 0),
             margen_objetivo REAL NOT NULL DEFAULT 0.4,
-            activo INTEGER NOT NULL DEFAULT 1 CHECK (activo IN (0, 1)),
-            notas TEXT
+            activo BOOLEAN NOT NULL DEFAULT TRUE,
+            notas TEXT,
+            tiempo_preparacion_min REAL NOT NULL DEFAULT 0,
+            unidades_por_lote INTEGER NOT NULL DEFAULT 1,
+            consumo_kwh_programa REAL NOT NULL DEFAULT 0
         );
     """)
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS receta_ingredientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            receta_id INTEGER NOT NULL,
-            ingrediente_id INTEGER NOT NULL,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            receta_id INTEGER NOT NULL REFERENCES recetas(id) ON DELETE CASCADE,
+            ingrediente_id INTEGER NOT NULL REFERENCES ingredientes(id) ON DELETE RESTRICT,
             cantidad REAL NOT NULL CHECK (cantidad > 0),
-            FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE CASCADE,
-            FOREIGN KEY (ingrediente_id) REFERENCES ingredientes(id) ON DELETE RESTRICT,
             UNIQUE (receta_id, ingrediente_id)
         );
     """)
 
-    # Migración: columnas de mano de obra en recetas (tiempo que toma
-    # preparar un lote y cuántas unidades rinde ese lote). Se agregan con
-    # ALTER TABLE porque la tabla `recetas` ya pudo existir de antes.
-    columnas_recetas = {f["name"] for f in cursor.execute("PRAGMA table_info(recetas)").fetchall()}
-    if "tiempo_preparacion_min" not in columnas_recetas:
-        cursor.execute(
-            "ALTER TABLE recetas ADD COLUMN tiempo_preparacion_min REAL NOT NULL DEFAULT 0"
-        )
-    if "unidades_por_lote" not in columnas_recetas:
-        cursor.execute(
-            "ALTER TABLE recetas ADD COLUMN unidades_por_lote INTEGER NOT NULL DEFAULT 1"
-        )
+    # --- Módulo de Stock (ver stock.py) -------------------------------------
+    # `tipo` distingue ingredientes (harina, aceite) de insumos (bolsas,
+    # cajas, etiquetas): ambos viven en la misma tabla y se manejan igual;
+    # cada modelo de bolsa es su propio ítem. `stock_minimo` está en la
+    # unidad base. La cantidad actual NO se guarda: es la suma de
+    # movimientos_stock.
 
-    # Migración: consumo eléctrico del programa de la máquina de pan que usa
-    # esta receta (kWh por lote), para calcular su costo de luz propio en vez
-    # de un % genérico sobre el costo directo (ver configuracion_costos más abajo).
-    if "consumo_kwh_programa" not in columnas_recetas:
-        cursor.execute(
-            "ALTER TABLE recetas ADD COLUMN consumo_kwh_programa REAL NOT NULL DEFAULT 0"
-        )
+    sentencias.append("""
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS tipo TEXT NOT NULL DEFAULT 'ingrediente'
+            CHECK (tipo IN ('ingrediente', 'insumo'));
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS stock_minimo REAL NOT NULL DEFAULT 0
+            CHECK (stock_minimo >= 0);
+    """)
+
+    # `cantidad` va con signo y en unidad base (compra/ajuste positivo,
+    # uso/merma negativo). Las compras guardan además el formato en que
+    # se compró (ej. "2 × 500 ml") y lo pagado, para trazabilidad.
+    sentencias.append("""
+        CREATE TABLE IF NOT EXISTS movimientos_stock (
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            ingrediente_id INTEGER NOT NULL REFERENCES ingredientes(id) ON DELETE CASCADE,
+            tipo TEXT NOT NULL CHECK (tipo IN ('compra', 'uso', 'merma', 'ajuste')),
+            cantidad REAL NOT NULL CHECK (cantidad <> 0),
+            formato TEXT,
+            precio_total REAL CHECK (precio_total IS NULL OR precio_total >= 0),
+            nota TEXT,
+            fecha TEXT NOT NULL
+        );
+    """)
+    sentencias.append("""
+        CREATE INDEX IF NOT EXISTS idx_movimientos_stock_ingrediente
+            ON movimientos_stock (ingrediente_id);
+    """)
 
     # --- Módulo de Flujo de caja -------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS movimientos_caja (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             tipo TEXT NOT NULL CHECK (tipo IN ('ingreso', 'gasto')),
             monto REAL NOT NULL CHECK (monto > 0),
             medio_pago TEXT NOT NULL CHECK (medio_pago IN ('efectivo', 'debito', 'credito', 'transferencia')),
@@ -121,43 +226,6 @@ def inicializar_db() -> None:
         );
     """)
 
-    # Migración: agregar 'credito' como medio de pago válido. SQLite no
-    # permite modificar un CHECK existente con ALTER TABLE, así que la
-    # tabla se reconstruye siguiendo el procedimiento que recomienda SQLite
-    # para cambios de esquema (crear tabla nueva, copiar datos, reemplazar).
-    def _check_admite_credito(nombre_tabla: str) -> bool:
-        fila = cursor.execute(
-            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?", (nombre_tabla,)
-        ).fetchone()
-        return fila is not None and "'credito'" in fila["sql"]
-
-    if not _check_admite_credito("movimientos_caja"):
-        # PRAGMA foreign_keys es un no-op si hay una transacción implícita
-        # pendiente (ej. abierta por un INSERT anterior) — hay que cerrarla
-        # con commit() antes, o el toggle a OFF se ignora silenciosamente.
-        conn.commit()
-        cursor.execute("PRAGMA foreign_keys=OFF")
-        cursor.execute("DROP TABLE IF EXISTS movimientos_caja_new")
-        cursor.execute("""
-            CREATE TABLE movimientos_caja_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                tipo TEXT NOT NULL CHECK (tipo IN ('ingreso', 'gasto')),
-                monto REAL NOT NULL CHECK (monto > 0),
-                medio_pago TEXT NOT NULL CHECK (medio_pago IN ('efectivo', 'debito', 'credito', 'transferencia')),
-                categoria TEXT,
-                descripcion TEXT,
-                fecha TEXT NOT NULL
-            );
-        """)
-        cursor.execute(
-            """INSERT INTO movimientos_caja_new (id, tipo, monto, medio_pago, categoria, descripcion, fecha)
-               SELECT id, tipo, monto, medio_pago, categoria, descripcion, fecha FROM movimientos_caja"""
-        )
-        cursor.execute("DROP TABLE movimientos_caja")
-        cursor.execute("ALTER TABLE movimientos_caja_new RENAME TO movimientos_caja")
-        conn.commit()
-        cursor.execute("PRAGMA foreign_keys=ON")
-
     # --- Módulo de Comisiones de medios de pago -----------------------------
     # Fila única (id = 1) con las tasas de comisión que cobra el medio de
     # pago electrónico (ej. Mercado Pago Point) por cobrar con tarjeta.
@@ -165,7 +233,7 @@ def inicializar_db() -> None:
     # cuando se cobra un pedido con débito o crédito (ver pedidos.py).
     # Los porcentajes se guardan como fracción (ej. 0.0219 = 2,19%).
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_comisiones (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             tasa_debito_pct REAL NOT NULL DEFAULT 0 CHECK (tasa_debito_pct >= 0),
@@ -173,16 +241,17 @@ def inicializar_db() -> None:
             iva_pct REAL NOT NULL DEFAULT 0 CHECK (iva_pct >= 0)
         );
     """)
-    cursor.execute("""
-        INSERT OR IGNORE INTO configuracion_comisiones (id, tasa_debito_pct, tasa_credito_pct, iva_pct)
-        VALUES (1, 0.0219, 0.0269, 0.19);
+    sentencias.append("""
+        INSERT INTO configuracion_comisiones (id, tasa_debito_pct, tasa_credito_pct, iva_pct)
+        VALUES (1, 0.0219, 0.0269, 0.19)
+        ON CONFLICT (id) DO NOTHING;
     """)
 
     # --- Módulo de Costos indirectos ---------------------------------------
     # Fila única (id = 1) con los parámetros globales para prorratear
     # costos indirectos al costeo de cada receta.
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_costos (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             costo_empaque_unidad REAL NOT NULL DEFAULT 0 CHECK (costo_empaque_unidad >= 0),
@@ -191,27 +260,11 @@ def inicializar_db() -> None:
             factor_descuento_luz REAL NOT NULL DEFAULT 1 CHECK (factor_descuento_luz >= 0 AND factor_descuento_luz <= 1)
         );
     """)
-    # Migración: la luz dejó de calcularse como % global sobre el costo
-    # directo (`recargo_luz_pct`) y pasó a calcularse por receta según el
-    # consumo de su programa (`recetas.consumo_kwh_programa`) — ver
-    # costos_indirectos.py y recetas.py. La columna vieja `recargo_luz_pct`
-    # puede quedar en bases existentes sin usarse; acá solo se agregan las
-    # columnas nuevas si faltan (tiene que ir antes del INSERT de más abajo,
-    # porque en bases existentes la tabla ya existía sin estas columnas).
-    columnas_costos = {f["name"] for f in cursor.execute("PRAGMA table_info(configuracion_costos)").fetchall()}
-    if "tarifa_electrica_kwh" not in columnas_costos:
-        cursor.execute(
-            "ALTER TABLE configuracion_costos ADD COLUMN tarifa_electrica_kwh REAL NOT NULL DEFAULT 0"
-        )
-    if "factor_descuento_luz" not in columnas_costos:
-        cursor.execute(
-            "ALTER TABLE configuracion_costos ADD COLUMN factor_descuento_luz REAL NOT NULL DEFAULT 1"
-        )
-
-    cursor.execute("""
-        INSERT OR IGNORE INTO configuracion_costos
+    sentencias.append("""
+        INSERT INTO configuracion_costos
             (id, costo_empaque_unidad, valor_hora_mano_obra, tarifa_electrica_kwh, factor_descuento_luz)
-        VALUES (1, 0, 0, 0, 1);
+        VALUES (1, 0, 0, 0, 1)
+        ON CONFLICT (id) DO NOTHING;
     """)
 
     # --- Módulo de Producción (capacidad diaria) ----------------------------
@@ -219,22 +272,23 @@ def inicializar_db() -> None:
     # usada junto con tiempo_preparacion_min/unidades_por_lote de cada
     # receta para calcular cuánto se puede comprometer por día (Pedidos).
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS configuracion_produccion (
             id INTEGER PRIMARY KEY CHECK (id = 1),
             horas_disponibles_dia REAL NOT NULL DEFAULT 0 CHECK (horas_disponibles_dia >= 0)
         );
     """)
-    cursor.execute("""
-        INSERT OR IGNORE INTO configuracion_produccion (id, horas_disponibles_dia)
-        VALUES (1, 0);
+    sentencias.append("""
+        INSERT INTO configuracion_produccion (id, horas_disponibles_dia)
+        VALUES (1, 0)
+        ON CONFLICT (id) DO NOTHING;
     """)
 
     # --- Módulo de Clientes --------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS clientes (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             nombre TEXT NOT NULL,
             telefono TEXT,
             direccion TEXT,
@@ -245,112 +299,150 @@ def inicializar_db() -> None:
 
     # --- Módulo de Pedidos ---------------------------------------------------
 
-    cursor.execute("""
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS pedidos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            cliente_id INTEGER NOT NULL,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            cliente_id INTEGER NOT NULL REFERENCES clientes(id) ON DELETE RESTRICT,
             fecha_entrega TEXT NOT NULL,
-            estado TEXT NOT NULL DEFAULT 'pendiente'
-                CHECK (estado IN ('pendiente', 'confirmado', 'entregado', 'cancelado')),
-            pagado INTEGER NOT NULL DEFAULT 0 CHECK (pagado IN (0, 1)),
+            estado TEXT NOT NULL DEFAULT 'recibido'
+                CHECK (estado IN ('recibido', 'confirmado', 'en_produccion', 'listo', 'entregado', 'cancelado')),
+            pagado BOOLEAN NOT NULL DEFAULT FALSE,
             medio_pago TEXT CHECK (medio_pago IN ('efectivo', 'debito', 'credito', 'transferencia')),
             notas TEXT,
             fecha_creacion TEXT NOT NULL,
-            FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT
+            canal_origen TEXT CHECK (canal_origen IN ('whatsapp', 'presencial', 'instagram', 'otro')),
+            fecha_entregado TEXT,
+            fecha_pago TEXT
         );
     """)
 
-    cursor.execute("""
+    # Migración de bases creadas antes del flujo de estados completo
+    # (recibido → confirmado → en producción → listo → entregado), cuando
+    # solo existían pendiente/confirmado/entregado/cancelado y entregar y
+    # cobrar eran una sola acción. Es idempotente: las columnas usan
+    # IF NOT EXISTS y el cambio de CHECK solo corre si el CHECK vigente
+    # todavía no conoce 'recibido' (en una base ya migrada no hace nada).
+    sentencias.append("""
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS canal_origen TEXT
+            CHECK (canal_origen IN ('whatsapp', 'presencial', 'instagram', 'otro'));
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fecha_entregado TEXT;
+        ALTER TABLE pedidos ADD COLUMN IF NOT EXISTS fecha_pago TEXT;
+    """)
+    sentencias.append("""
+        DO $$
+        DECLARE
+            r RECORD;
+        BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_constraint
+                WHERE conrelid = 'pedidos'::regclass
+                  AND conname = 'pedidos_estado_check'
+                  AND position('recibido' in pg_get_constraintdef(oid)) > 0
+            ) THEN
+                -- Se borra el CHECK viejo de estado sin depender de su
+                -- nombre (cualquier CHECK de pedidos que mencione 'pendiente').
+                FOR r IN
+                    SELECT conname FROM pg_constraint
+                    WHERE conrelid = 'pedidos'::regclass AND contype = 'c'
+                      AND position('pendiente' in pg_get_constraintdef(oid)) > 0
+                LOOP
+                    EXECUTE 'ALTER TABLE pedidos DROP CONSTRAINT ' || quote_ident(r.conname);
+                END LOOP;
+                ALTER TABLE pedidos DROP CONSTRAINT IF EXISTS pedidos_estado_check;
+                UPDATE pedidos SET estado = 'recibido' WHERE estado = 'pendiente';
+                ALTER TABLE pedidos ALTER COLUMN estado SET DEFAULT 'recibido';
+                ALTER TABLE pedidos ADD CONSTRAINT pedidos_estado_check CHECK
+                    (estado IN ('recibido', 'confirmado', 'en_produccion', 'listo', 'entregado', 'cancelado'));
+                -- Los pedidos ya entregados/pagados no guardaban cuándo:
+                -- se usa la fecha de entrega como mejor aproximación.
+                UPDATE pedidos SET fecha_entregado = fecha_entrega
+                    WHERE estado = 'entregado' AND fecha_entregado IS NULL;
+                UPDATE pedidos SET fecha_pago = fecha_entrega
+                    WHERE pagado AND fecha_pago IS NULL;
+            END IF;
+        END $$;
+    """)
+
+    sentencias.append("""
         CREATE TABLE IF NOT EXISTS pedido_items (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            pedido_id INTEGER NOT NULL,
-            receta_id INTEGER NOT NULL,
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            pedido_id INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
+            receta_id INTEGER NOT NULL REFERENCES recetas(id) ON DELETE RESTRICT,
             cantidad INTEGER NOT NULL CHECK (cantidad > 0),
             precio_unitario REAL NOT NULL CHECK (precio_unitario >= 0),
-            FOREIGN KEY (pedido_id) REFERENCES pedidos(id) ON DELETE CASCADE,
-            FOREIGN KEY (receta_id) REFERENCES recetas(id) ON DELETE RESTRICT,
             UNIQUE (pedido_id, receta_id)
         );
     """)
 
-    # Migración: pedidos guardaba antes el cliente como texto libre
-    # (cliente_nombre/cliente_telefono). Se convierte cada combinación ya
-    # usada en un cliente real de la tabla `clientes`, se enlazan los
-    # pedidos existentes por cliente_id, y se eliminan las columnas viejas.
-    columnas_pedidos = {f["name"] for f in cursor.execute("PRAGMA table_info(pedidos)").fetchall()}
-    if "cliente_nombre" in columnas_pedidos:
-        if "cliente_id" not in columnas_pedidos:
-            cursor.execute("ALTER TABLE pedidos ADD COLUMN cliente_id INTEGER REFERENCES clientes(id)")
+    # --- Stock ligado a recetas y pedidos (ver stock.py) -----------------------
+    # `recetas.empaque_ingrediente_id`: la bolsa (ítem de stock) que usa esa
+    # receta, 1 por unidad vendida. Su precio reemplaza al empaque fijo de
+    # configuracion_costos; sin bolsa asignada se sigue usando el fijo.
+    # `movimientos_stock.pedido_id`: de qué pedido salió un movimiento 'uso',
+    # para descontar una sola vez y poder revertir si el pedido vuelve atrás.
+    sentencias.append("""
+        ALTER TABLE recetas ADD COLUMN IF NOT EXISTS empaque_ingrediente_id INTEGER
+            REFERENCES ingredientes(id) ON DELETE SET NULL;
+        ALTER TABLE movimientos_stock ADD COLUMN IF NOT EXISTS pedido_id INTEGER
+            REFERENCES pedidos(id) ON DELETE SET NULL;
+        CREATE INDEX IF NOT EXISTS idx_movimientos_stock_pedido ON movimientos_stock (pedido_id);
+    """)
 
-        combinaciones = cursor.execute(
-            """SELECT DISTINCT TRIM(cliente_nombre) AS nombre, TRIM(cliente_telefono) AS telefono
-               FROM pedidos WHERE cliente_id IS NULL"""
-        ).fetchall()
+    # `ingredientes.categoria`: solo para tipo 'insumo' (empaque, papel,
+    # proteccion, limpieza, otro; ver ingredientes.CATEGORIAS_INSUMO). Un
+    # ingrediente no tiene categoría. Las recetas solo ofrecen como bolsa los
+    # insumos de categoría 'empaque'. Migración de lo cargado en la v4: los
+    # insumos que ya eran la bolsa de alguna receta, o que se llaman
+    # bolsa/caja/empaque, pasan a 'empaque'; el resto de insumos a 'otro'
+    # (se corrige en Stock → Configurar). Idempotente: solo toca categoria NULL.
+    # Ojo: aquí no se puede usar LIKE '%…%': conn.execute pasa params y
+    # psycopg2 toma cada % como marcador (dio IndexError el 2026-11-17).
+    sentencias.append("""
+        ALTER TABLE ingredientes ADD COLUMN IF NOT EXISTS categoria TEXT;
+        UPDATE ingredientes SET categoria = 'empaque'
+            WHERE tipo = 'insumo' AND categoria IS NULL
+              AND (id IN (SELECT empaque_ingrediente_id FROM recetas WHERE empaque_ingrediente_id IS NOT NULL)
+                   OR strpos(lower(nombre), 'bolsa') > 0 OR strpos(lower(nombre), 'caja') > 0
+                   OR strpos(lower(nombre), 'empaque') > 0);
+        UPDATE ingredientes SET categoria = 'otro' WHERE tipo = 'insumo' AND categoria IS NULL;
+    """)
 
-        ahora = datetime.now().isoformat(timespec="seconds")
-        for combinacion in combinaciones:
-            nombre = combinacion["nombre"]
-            telefono = combinacion["telefono"] or None
+    # --- Módulo de Cobranza ---------------------------------------------------
+    # Fila única (id = 1): a los cuántos días desde la entrega se considera
+    # que corresponde recordarle el pago a un cliente que no ha pagado. No
+    # es un plazo de pago, solo el umbral del aviso (ver pedidos.py).
 
-            cliente = cursor.execute(
-                "SELECT id FROM clientes WHERE nombre = ? AND IFNULL(telefono, '') = IFNULL(?, '')",
-                (nombre, telefono),
-            ).fetchone()
-            if cliente is None:
-                cursor.execute(
-                    "INSERT INTO clientes (nombre, telefono, fecha_creacion) VALUES (?, ?, ?)",
-                    (nombre, telefono, ahora),
-                )
-                cliente_id = cursor.lastrowid
-            else:
-                cliente_id = cliente["id"]
+    sentencias.append("""
+        CREATE TABLE IF NOT EXISTS configuracion_cobranza (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            dias_recordatorio INTEGER NOT NULL DEFAULT 3 CHECK (dias_recordatorio >= 0)
+        );
+    """)
+    sentencias.append("""
+        INSERT INTO configuracion_cobranza (id, dias_recordatorio)
+        VALUES (1, 3)
+        ON CONFLICT (id) DO NOTHING;
+    """)
 
-            cursor.execute(
-                """UPDATE pedidos SET cliente_id = ?
-                   WHERE TRIM(cliente_nombre) = ? AND IFNULL(TRIM(cliente_telefono), '') = IFNULL(?, '')
-                     AND cliente_id IS NULL""",
-                (cliente_id, nombre, telefono),
-            )
+    # --- Módulo de WhatsApp (ver whatsapp.py) --------------------------------
+    # Historial de cada mensaje de WhatsApp Business enviado por un pedido
+    # (pedido creado, confirmado, recordatorio de pago, pagado), haya salido
+    # bien o mal. Sirve para auditar envíos y para no perder el rastro de un
+    # envío fallido (número inválido, plantilla no aprobada, etc.).
 
-        cursor.execute("ALTER TABLE pedidos DROP COLUMN cliente_nombre")
-        cursor.execute("ALTER TABLE pedidos DROP COLUMN cliente_telefono")
+    sentencias.append("""
+        CREATE TABLE IF NOT EXISTS mensajes_whatsapp (
+            id INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            pedido_id INTEGER NOT NULL REFERENCES pedidos(id) ON DELETE CASCADE,
+            tipo TEXT NOT NULL CHECK (tipo IN
+                ('pedido_creado', 'pedido_confirmado', 'recordatorio_pago', 'pedido_pagado')),
+            telefono TEXT NOT NULL,
+            estado TEXT NOT NULL CHECK (estado IN ('enviado', 'fallido')),
+            error TEXT,
+            fecha_envio TEXT NOT NULL
+        );
+    """)
 
-    # Migración: agregar 'credito' como medio de pago válido en pedidos
-    # (mismo motivo y procedimiento que en movimientos_caja, más arriba).
-    if not _check_admite_credito("pedidos"):
-        conn.commit()
-        cursor.execute("PRAGMA foreign_keys=OFF")
-        cursor.execute("DROP TABLE IF EXISTS pedidos_new")
-        cursor.execute("""
-            CREATE TABLE pedidos_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                cliente_id INTEGER NOT NULL,
-                fecha_entrega TEXT NOT NULL,
-                estado TEXT NOT NULL DEFAULT 'pendiente'
-                    CHECK (estado IN ('pendiente', 'confirmado', 'entregado', 'cancelado')),
-                pagado INTEGER NOT NULL DEFAULT 0 CHECK (pagado IN (0, 1)),
-                medio_pago TEXT CHECK (medio_pago IN ('efectivo', 'debito', 'credito', 'transferencia')),
-                notas TEXT,
-                fecha_creacion TEXT NOT NULL,
-                FOREIGN KEY (cliente_id) REFERENCES clientes(id) ON DELETE RESTRICT
-            );
-        """)
-        cursor.execute(
-            """INSERT INTO pedidos_new
-                   (id, cliente_id, fecha_entrega, estado, pagado, medio_pago, notas, fecha_creacion)
-               SELECT id, cliente_id, fecha_entrega, estado, pagado, medio_pago, notas, fecha_creacion
-               FROM pedidos"""
-        )
-        cursor.execute("DROP TABLE pedidos")
-        cursor.execute("ALTER TABLE pedidos_new RENAME TO pedidos")
-        conn.commit()
-        cursor.execute("PRAGMA foreign_keys=ON")
-
-        problemas = cursor.execute("PRAGMA foreign_key_check").fetchall()
-        if problemas:
-            raise RuntimeError(
-                f"Migración de 'pedidos' dejó referencias rotas, revisar antes de continuar: {problemas}"
-            )
-
+    conn.execute("\n".join(sentencias))
     conn.commit()
     conn.close()

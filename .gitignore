@@ -18,3 +18,11 @@ __pycache__/
 # Entornos virtuales, por si se usan más adelante
 venv/
 .venv/
+
+# Variables de entorno (claves de Supabase u otras)
+.env
+.env.*
+
+# Exportaciones de datos
+*.csv
+*.xlsx

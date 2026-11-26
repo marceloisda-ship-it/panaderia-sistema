@@ -29,9 +29,10 @@ enchufable, se aplica este factor (ej. 0.65 = se estima que el consumo real
 es un 65% del teórico) para no sobreestimar el costo de luz.
 """
 
-from db import conectar
+from db import conectar, cache_lectura
 
 
+@cache_lectura
 def obtener_configuracion() -> dict:
     """Retorna la configuración actual de costos indirectos."""
     conn = conectar()
@@ -66,8 +67,8 @@ def actualizar_configuracion(costo_empaque_unidad: float, valor_hora_mano_obra: 
     try:
         conn.execute(
             """UPDATE configuracion_costos
-               SET costo_empaque_unidad = ?, valor_hora_mano_obra = ?,
-                   tarifa_electrica_kwh = ?, factor_descuento_luz = ?
+               SET costo_empaque_unidad = %s, valor_hora_mano_obra = %s,
+                   tarifa_electrica_kwh = %s, factor_descuento_luz = %s
                WHERE id = 1""",
             (costo_empaque_unidad, valor_hora_mano_obra, tarifa_electrica_kwh, factor_descuento_luz),
         )

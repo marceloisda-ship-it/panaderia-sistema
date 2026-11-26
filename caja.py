@@ -13,7 +13,7 @@ este mes?".
 """
 
 from datetime import date
-from db import conectar
+from db import conectar, cache_lectura
 
 TIPOS_VALIDOS = ("ingreso", "gasto")
 MEDIOS_VALIDOS = ("transferencia", "debito", "credito", "efectivo")
@@ -22,11 +22,66 @@ MEDIOS_CON_COMISION = ("debito", "credito")
 
 def registrar_movimiento(tipo: str, monto: float, medio_pago: str,
                           categoria: str | None = None, descripcion: str | None = None,
-                          fecha: str | None = None) -> int:
+                          fecha: str | None = None, conn=None) -> int:
     """Registra un ingreso o gasto en la caja. Retorna el id del movimiento.
 
     `fecha` debe ir en formato YYYY-MM-DD; si no se indica, se usa hoy.
+
+    `conn` es opcional: si se pasa una conexión ya abierta (por ejemplo
+    desde pedidos.entregar_y_cobrar, para que la actualización del pedido
+    y el ingreso en caja queden en una sola transacción), se usa esa
+    misma conexión sin comitear ni cerrarla — es responsabilidad de quien
+    la pasó. Si no se pasa, se abre y cierra una conexión propia, como
+    siempre.
     """
+    if tipo not in TIPOS_VALIDOS:
+        raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
+    if medio_pago not in MEDIOS_VALIDOS:
+        raise ValueError(f"medio_pago debe ser uno de {MEDIOS_VALIDOS}")
+    if monto <= 0:
+        raise ValueError("El monto debe ser mayor a 0")
+
+    fecha = fecha or date.today().isoformat()
+
+    conexion_propia = conn is None
+    if conexion_propia:
+        conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.execute(
+            """INSERT INTO movimientos_caja (tipo, monto, medio_pago, categoria, descripcion, fecha)
+               VALUES (%s, %s, %s, %s, %s, %s)
+               RETURNING id""",
+            (tipo, monto, medio_pago, categoria, descripcion, fecha),
+        )
+        movimiento_id = cursor.fetchone()["id"]
+        if conexion_propia:
+            conn.commit()
+        return movimiento_id
+    finally:
+        if conexion_propia:
+            conn.close()
+
+
+def eliminar_movimiento(movimiento_id: int) -> None:
+    """Elimina un movimiento de caja (ej. si se registró por error)."""
+    conn = conectar()
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM movimientos_caja WHERE id = %s", (movimiento_id,))
+        if cursor.fetchone() is None:
+            raise ValueError(f"No existe un movimiento con id {movimiento_id}")
+        cursor.execute("DELETE FROM movimientos_caja WHERE id = %s", (movimiento_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def actualizar_movimiento(movimiento_id: int, tipo: str, monto: float, medio_pago: str,
+                          categoria: str | None = None, descripcion: str | None = None,
+                          fecha: str | None = None) -> None:
+    """Corrige un movimiento de caja ya registrado (ej. un monto mal
+    tipeado). Valida igual que `registrar_movimiento`."""
     if tipo not in TIPOS_VALIDOS:
         raise ValueError(f"tipo debe ser uno de {TIPOS_VALIDOS}")
     if medio_pago not in MEDIOS_VALIDOS:
@@ -40,30 +95,20 @@ def registrar_movimiento(tipo: str, monto: float, medio_pago: str,
     try:
         cursor = conn.cursor()
         cursor.execute(
-            """INSERT INTO movimientos_caja (tipo, monto, medio_pago, categoria, descripcion, fecha)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (tipo, monto, medio_pago, categoria, descripcion, fecha),
+            """UPDATE movimientos_caja
+               SET tipo = %s, monto = %s, medio_pago = %s, categoria = %s, descripcion = %s, fecha = %s
+               WHERE id = %s
+               RETURNING id""",
+            (tipo, monto, medio_pago, categoria, descripcion, fecha, movimiento_id),
         )
-        conn.commit()
-        return cursor.lastrowid
-    finally:
-        conn.close()
-
-
-def eliminar_movimiento(movimiento_id: int) -> None:
-    """Elimina un movimiento de caja (ej. si se registró por error)."""
-    conn = conectar()
-    try:
-        cursor = conn.cursor()
-        cursor.execute("SELECT id FROM movimientos_caja WHERE id = ?", (movimiento_id,))
         if cursor.fetchone() is None:
             raise ValueError(f"No existe un movimiento con id {movimiento_id}")
-        cursor.execute("DELETE FROM movimientos_caja WHERE id = ?", (movimiento_id,))
         conn.commit()
     finally:
         conn.close()
 
 
+@cache_lectura
 def listar_movimientos(desde: str | None = None, hasta: str | None = None,
                         tipo: str | None = None, medio_pago: str | None = None) -> list[dict]:
     """Lista movimientos de caja, más recientes primero.
@@ -75,16 +120,16 @@ def listar_movimientos(desde: str | None = None, hasta: str | None = None,
     parametros = []
 
     if desde:
-        condiciones.append("fecha >= ?")
+        condiciones.append("fecha >= %s")
         parametros.append(desde)
     if hasta:
-        condiciones.append("fecha <= ?")
+        condiciones.append("fecha <= %s")
         parametros.append(hasta)
     if tipo:
-        condiciones.append("tipo = ?")
+        condiciones.append("tipo = %s")
         parametros.append(tipo)
     if medio_pago:
-        condiciones.append("medio_pago = ?")
+        condiciones.append("medio_pago = %s")
         parametros.append(medio_pago)
 
     query = "SELECT * FROM movimientos_caja"
@@ -104,8 +149,14 @@ def resumen_periodo(desde: str | None = None, hasta: str | None = None) -> dict:
     """Retorna un resumen de ingresos y gastos en un período (o de toda la
     historia, si no se indican fechas), desglosado por medio de pago.
     """
-    movimientos = listar_movimientos(desde=desde, hasta=hasta)
+    return resumir_movimientos(listar_movimientos(desde=desde, hasta=hasta), desde, hasta)
 
+
+def resumir_movimientos(movimientos: list[dict], desde: str | None = None,
+                        hasta: str | None = None) -> dict:
+    """Cálculo puro (sin acceso a datos) de `resumen_periodo` a partir de
+    movimientos ya traídos — lo reusa el dashboard, que trae todo en una
+    sola consulta."""
     total_ingresos = 0.0
     total_gastos = 0.0
     por_medio_pago = {m: {"ingresos": 0.0, "gastos": 0.0} for m in MEDIOS_VALIDOS}
@@ -155,6 +206,7 @@ def saldo_actual() -> float:
 
 # --- Comisiones de medios de pago (ej. Mercado Pago Point) -----------------
 
+@cache_lectura
 def obtener_configuracion_comisiones() -> dict:
     """Retorna las tasas de comisión configuradas para débito y crédito
     (como fracción, ej. 0.0219 = 2,19%) y el IVA que se les aplica encima."""
@@ -180,7 +232,7 @@ def actualizar_configuracion_comisiones(tasa_debito_pct: float, tasa_credito_pct
     try:
         conn.execute(
             """UPDATE configuracion_comisiones
-               SET tasa_debito_pct = ?, tasa_credito_pct = ?, iva_pct = ?
+               SET tasa_debito_pct = %s, tasa_credito_pct = %s, iva_pct = %s
                WHERE id = 1""",
             (tasa_debito_pct, tasa_credito_pct, iva_pct),
         )
