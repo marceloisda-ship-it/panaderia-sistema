@@ -2,7 +2,7 @@
 
 Aplicación de datos que uso a diario para operar mi emprendimiento de panadería: costeo de recetas, stock, pedidos, clientes, flujo de caja y KPIs. Partió como una app local sobre SQLite y hoy corre en la nube, sobre PostgreSQL (Supabase) y Streamlit Community Cloud.
 
-**Stack:** Python · pandas · Streamlit · PostgreSQL (Supabase) · psycopg2 · Supabase Auth · WhatsApp Business Cloud API · GitHub Actions · Playwright
+**Stack:** Python · pandas · Streamlit · PostgreSQL (Supabase) · psycopg2 · Supabase Auth · GitHub Actions · Playwright
 
 ## Qué resuelve
 
@@ -14,7 +14,7 @@ Aplicación de datos que uso a diario para operar mi emprendimiento de panaderí
 | Clientes | Ficha, historial y rankings: quién compra más y qué pan se pide más. |
 | Flujo de caja | Ingresos y gastos por medio de pago y categoría, con comisiones de pagos electrónicos. |
 | Dashboard | KPIs mensuales comparados con el mes anterior, incluido qué pan se vende más y cuál deja más margen. |
-| WhatsApp | Avisos al cliente en los hitos del pedido mediante plantillas aprobadas por Meta. Cada envío queda registrado. |
+| WhatsApp *(en desarrollo)* | Avisos al cliente en los hitos del pedido mediante plantillas de WhatsApp Business (Cloud API de Meta), con registro de cada envío. Aún no está activo en producción. |
 
 ## Arquitectura
 
@@ -25,7 +25,7 @@ flowchart LR
     A --> L[Módulos de negocio<br/>pedidos, stock, recetas, caja...]
     L --> DB[db.py<br/>pool de conexiones + caché]
     DB --> PG[(PostgreSQL<br/>Supabase)]
-    L --> WA[WhatsApp Business<br/>Cloud API]
+    L -. en desarrollo .-> WA[WhatsApp Business<br/>Cloud API]
     GH[GitHub Actions<br/>keep-alive con Playwright] -. cada hora .-> A
 ```
 
@@ -33,7 +33,7 @@ flowchart LR
 - **Pool de conexiones.** `db.py` reutiliza conexiones con `psycopg2` en vez de abrir una nueva en cada consulta: abrir una conexión TLS contra Supabase toma unos 800 ms y tomarla del pool, entre 10 y 20 ms.
 - **Caché que se invalida al escribir.** Las lecturas se cachean con `st.cache_data` y toda escritura limpia esa caché, así que todos los usuarios conectados ven el dato nuevo.
 - **Esquema versionado.** `inicializar_db()` crea las tablas y aplica migraciones al arrancar. `VERSION_ESQUEMA` obliga a Streamlit Cloud a correr la migración nueva después de cada despliegue.
-- **Credenciales fuera del código.** La conexión, Supabase Auth y WhatsApp se configuran en `st.secrets` (`.streamlit/secrets.toml` en local, panel de Secrets en Streamlit Cloud).
+- **Credenciales fuera del código.** La conexión a la base y Supabase Auth se configuran en `st.secrets` (`.streamlit/secrets.toml` en local, panel de Secrets en Streamlit Cloud).
 - **Acceso controlado.** Login con Supabase Auth; los usuarios se crean a mano, sin auto-registro.
 - **App siempre disponible.** Un workflow de GitHub Actions abre la app cada hora con Playwright para que Streamlit Cloud no la duerma.
 
@@ -81,7 +81,7 @@ Requiere Python 3.10+ y un proyecto en Supabase.
    url = "https://<proyecto>.supabase.co"
    anon_key = "..."
 
-   # Opcional: avisos por WhatsApp
+   # Opcional: avisos por WhatsApp (en desarrollo)
    [whatsapp]
    phone_number_id = "..."
    access_token = "..."
@@ -106,7 +106,7 @@ El repositorio incluye un Dev Container: en GitHub Codespaces deja las dependenc
 ├── clientes.py             # Fichas y rankings de clientes
 ├── caja.py                 # Flujo de caja
 ├── dashboard.py            # KPIs mensuales
-├── whatsapp.py             # Avisos por WhatsApp Business
+├── whatsapp.py             # Avisos por WhatsApp Business (en desarrollo)
 ├── migrar_datos.py         # Migración única de SQLite a Supabase (requiere `toml`)
 ├── legacy/main.py          # Primera versión: menú de consola
 ├── docs/manual.md          # Manual del negocio, hoja de ruta y bitácora

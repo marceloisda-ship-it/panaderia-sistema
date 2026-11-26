@@ -62,7 +62,7 @@ resume dónde quedó la última sesión y lo que no es obvio en el código.
 - Respaldo de Supabase **sin hacer** antes de esta migración: desde la red
   del PC de desarrollo no conecta a Supabase (timeout puertos 5432/6543).
   Hay que correr `respaldos_supabase/respaldo_supabase.py` desde otra red.
-- Etapa 3 (3 panificadoras) y siguientes: ver ver docs/manual.md.
+- Etapa 3 (3 panificadoras) y siguientes: ver docs/manual.md.
 
 ## Trampas conocidas
 - Cambios de esquema: subir `VERSION_ESQUEMA` en `db.py` **y** reiniciar
