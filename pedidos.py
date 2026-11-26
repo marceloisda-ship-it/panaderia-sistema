@@ -12,7 +12,7 @@ precio posterior no altere pedidos ya tomados.
 Cada pedido pertenece a un cliente de la ficha de clientes (ver
 clientes.py) — ya no se guarda como texto libre.
 
-Flujo de estados (ver README, "Flujo ideal de un pedido"):
+Flujo de estados (ver docs/manual.md, "Flujo ideal de un pedido"):
 
     recibido → confirmado → en_produccion → listo → entregado
     (cualquiera de los abiertos puede pasar a cancelado)

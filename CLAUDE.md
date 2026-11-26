@@ -1,6 +1,6 @@
 # Contexto para retomar (panadería — versión nube)
 
-Léelo junto con `README.md` (bitácora y hoja de ruta). Este archivo solo
+Léelo junto con `docs/manual.md` (bitácora y hoja de ruta). Este archivo solo
 resume dónde quedó la última sesión y lo que no es obvio en el código.
 Última actualización: 2026-11-13.
 
@@ -56,13 +56,13 @@ resume dónde quedó la última sesión y lo que no es obvio en el código.
 - La cantidad por ingrediente en recetas es **por unidad (un pan)**.
 
 ## Pendiente
-- Anticipar faltantes según los pedidos confirmados de la semana (README,
+- Anticipar faltantes según los pedidos confirmados de la semana (docs/manual.md,
   Etapa 4).
 - Cargar inventario inicial y mínimos (lo hace el usuario en la app).
 - Respaldo de Supabase **sin hacer** antes de esta migración: desde la red
   del PC de desarrollo no conecta a Supabase (timeout puertos 5432/6543).
   Hay que correr `respaldos_supabase/respaldo_supabase.py` desde otra red.
-- Etapa 3 (3 panificadoras) y siguientes: ver README.
+- Etapa 3 (3 panificadoras) y siguientes: ver ver docs/manual.md.
 
 ## Trampas conocidas
 - Cambios de esquema: subir `VERSION_ESQUEMA` en `db.py` **y** reiniciar
